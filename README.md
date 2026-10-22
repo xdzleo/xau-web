@@ -10,8 +10,13 @@ cargo build -p xau-web --release
 target/release/xau-web.exe          # opens the browser with the access key
 ```
 
-Windows only for signing in (WebView2). See [`crates/xau-web/README.md`](crates/xau-web/README.md)
-for how it works, the security model and the benchmark.
+On Windows the sign-in page runs in WebView2; anywhere else (a server) in headless Chromium.
+See [`crates/xau-web/README.md`](crates/xau-web/README.md) for how it works, the security model and
+the benchmark.
+
+**As a cloud server (Railway):** the `Dockerfile` and `railway.toml` run it 24 h a day, with
+everything meant for Microsoft leaving through Cloudflare WARP (and refused if it does not).
+See [`docs/DEPLOY-RAILWAY.md`](docs/DEPLOY-RAILWAY.md).
 
 The Android app it comes from lives in the same workspace; its description follows.
 

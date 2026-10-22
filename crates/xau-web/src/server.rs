@@ -12,14 +12,15 @@ use axum::{Json, Router};
 use serde_json::{json, Value};
 
 use crate::signin::{self, Logins};
-use crate::webhost::{self, CheckoutSpec, Host};
+use crate::webhost::{CheckoutSpec, Host};
 use crate::{assets, auth, profiles};
 
 #[derive(Clone)]
 pub struct App {
     pub key: Arc<String>,
     pub port: u16,
-    pub lan: bool,
+    pub access: auth::Access,
+    pub egress: Arc<crate::egress::Egress>,
     pub host: Host,
     pub logins: Arc<Logins>,
     /// `select` then `store_purchase_form` act on "the active account":
@@ -29,6 +30,7 @@ pub struct App {
 
 pub fn router(app: App) -> Router {
     Router::new()
+        .route("/healthz", get(healthz))
         .route("/", get(index))
         .route("/assets/*path", get(asset))
         .route("/api/info", get(info))
@@ -70,13 +72,13 @@ fn text(status: StatusCode, body: &'static str) -> Response {
 
 /// Every API call: this machine, the key, and (for a POST) this origin.
 fn guard(app: &App, h: &HeaderMap, post: bool) -> Result<(), Response> {
-    if !auth::host_ok(h, app.lan) {
+    if !app.access.host_ok(h) {
         return Err(text(StatusCode::FORBIDDEN, "host não permitido"));
     }
-    if !auth::cookie_ok(h, app.port, &app.key) {
+    if !app.access.cookie_ok(h, app.port, &app.key) {
         return Err(text(StatusCode::UNAUTHORIZED, "abra o link impresso no terminal"));
     }
-    if post && !auth::post_ok(h) {
+    if post && !app.access.post_ok(h) {
         return Err(text(StatusCode::FORBIDDEN, "origem não permitida"));
     }
     Ok(())
@@ -96,25 +98,32 @@ fn err(e: impl ToString) -> Response {
 
 // --------------------------------------------------------------- pages
 
+/// For the host's health check: that the server is up, and nothing else (no names, no data).
+async fn healthz() -> Response {
+    secure(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], "ok").into_response())
+}
+
 async fn index(State(app): State<App>, h: HeaderMap, Query(q): Query<HashMap<String, String>>) -> Response {
-    if !auth::host_ok(&h, app.lan) {
+    if !app.access.host_ok(&h) {
         return text(StatusCode::FORBIDDEN, "host não permitido");
     }
     // The printed link carries the key once; from then on a cookie does.
     if q.get("key").is_some_and(|k| auth::same(k, &app.key)) {
+        // Over https (a public server) the cookie is never sent over plain http.
+        let secure_flag = if app.access.scheme(&h) == "https" { "; Secure" } else { "" };
         let cookie = format!(
-            "{}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age=31536000",
-            auth::cookie_name(app.port),
+            "{}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age=31536000{secure_flag}",
+            app.access.cookie_name(app.port),
             app.key
         );
         return secure(
             (StatusCode::FOUND, [(header::LOCATION, "/".to_string()), (header::SET_COOKIE, cookie)]).into_response(),
         );
     }
-    if !auth::cookie_ok(&h, app.port, &app.key) {
+    if !app.access.cookie_ok(&h, app.port, &app.key) {
         return text(
             StatusCode::UNAUTHORIZED,
-            "Abra o link que o xau-web imprimiu no terminal (ele traz a chave deste computador).",
+            "Abra o link com a chave do xau-web (no terminal, ou nos logs do servidor).",
         );
     }
     match assets::get("index.html") {
@@ -124,7 +133,7 @@ async fn index(State(app): State<App>, h: HeaderMap, Query(q): Query<HashMap<Str
 }
 
 async fn asset(State(app): State<App>, h: HeaderMap, Path(path): Path<String>) -> Response {
-    if !auth::host_ok(&h, app.lan) {
+    if !app.access.host_ok(&h) {
         return text(StatusCode::FORBIDDEN, "host não permitido");
     }
     match assets::get(&path) {
@@ -140,8 +149,11 @@ async fn info(State(app): State<App>, h: HeaderMap) -> Response {
     json_response(json!({
         "version": env!("CARGO_PKG_VERSION"),
         "os": std::env::consts::OS,
-        "nativeWindows": webhost::NATIVE,
-        "lan": app.lan,
+        "nativeWindows": app.host.native(),
+        "signIn": true,
+        "lan": app.access.lan,
+        "public": app.access.public(),
+        "egress": app.egress.snapshot(),
         "dataDir": xau_mobile::accounts::data_dir().map(|p| p.display().to_string()).ok(),
     }))
 }
@@ -164,6 +176,10 @@ async fn call(State(app): State<App>, h: HeaderMap, Path(method): Path<String>, 
     }
     if !ALLOWED.contains(&method.as_str()) {
         return err(format!("método desconhecido: {method}"));
+    }
+    // Nothing goes to Microsoft except through Cloudflare, once that is confirmed.
+    if let Err(e) = app.egress.require() {
+        return err(e);
     }
     let args: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     let xuid = args.get("xuid").and_then(Value::as_str).map(str::to_string);
@@ -190,6 +206,9 @@ async fn call(State(app): State<App>, h: HeaderMap, Path(method): Path<String>, 
 async fn login_start(State(app): State<App>, h: HeaderMap) -> Response {
     if let Err(r) = guard(&app, &h, true) {
         return r;
+    }
+    if let Err(e) = app.egress.require() {
+        return err(e);
     }
     match signin::start(app.host.clone(), app.logins.clone()).await {
         Ok(id) => ok(json!({ "id": id })),
@@ -288,7 +307,7 @@ async fn login_ws(
     if let Err(r) = guard(&app, &h, false) {
         return r;
     }
-    if !auth::ws_origin_ok(&h) {
+    if !app.access.ws_origin_ok(&h) {
         return text(StatusCode::FORBIDDEN, "origem não permitida");
     }
     let n = |k: &str, d: u32| q.get(k).and_then(|v| v.parse::<u32>().ok()).unwrap_or(d);
@@ -426,7 +445,7 @@ async fn bench_start(State(app): State<App>, h: HeaderMap, Query(q): Query<HashM
     let url = format!("http://127.0.0.1:{}/bench-page{}", app.port, if anim { "#anim" } else { "" });
     // A real page for comparison: only Microsoft's sign-up (no account, nothing registered).
     let url = match q.get("url") {
-        Some(u) if u.starts_with("https://signup.live.com/") => u.clone(),
+        Some(u) if u.starts_with("https://signup.live.com/") || u == "https://www.cloudflare.com/cdn-cgi/trace" => u.clone(),
         _ => url,
     };
     let windows_ua = q.get("ua").is_some_and(|v| v == "win");
@@ -483,6 +502,9 @@ async fn checkout(State(app): State<App>, h: HeaderMap, body: Bytes) -> Response
         return err("faltou a conta ou o jogo");
     };
 
+    if let Err(e) = app.egress.require() {
+        return err(e);
+    }
     let _one_at_a_time = app.checkout.lock().await;
     if let Err(e) = xau_api::dispatch("select", &json!({ "xuid": xuid })).await {
         return err(e);

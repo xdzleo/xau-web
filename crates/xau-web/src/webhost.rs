@@ -80,7 +80,7 @@ mod imp {
     use wry::http::{HeaderMap, HeaderName, HeaderValue};
     use wry::{PageLoadEvent, WebContext, WebView, WebViewBuilder, WebViewBuilderExtWindows};
 
-    use super::{CheckoutSpec, SignInHandle, SignInSpec, WinEvent};
+    use super::{unhosted_signup, CheckoutSpec, SignInHandle, SignInSpec, WinEvent};
 
     pub enum Cmd {
         SignIn { id: u64, spec: SignInSpec, tx: UnboundedSender<WinEvent> },
@@ -386,24 +386,6 @@ mod imp {
         Ok(Entry { handle: id, webview, _ctx: ctx, _window: window, tx: Some(tx) })
     }
 
-    /// The sign-up URL without the Windows-hosted mode (`hosted`, `platform`, `uiflavor=win10host`,
-    /// `cxh-*`), when `url` is Microsoft's sign-up in that mode.
-    fn unhosted_signup(url: &str) -> Option<String> {
-        let (base, query) = url.split_once('?')?;
-        if !base.starts_with("https://signup.live.com/") {
-            return None;
-        }
-        let hosted = |p: &&str| {
-            let k = p.split('=').next().unwrap_or("").to_ascii_lowercase();
-            k == "hosted" || k == "platform" || k == "uiflavor" || k.starts_with("cxh-")
-        };
-        if !query.split('&').any(|p| hosted(&p)) {
-            return None;
-        }
-        let kept: Vec<&str> = query.split('&').filter(|p| !hosted(p)).collect();
-        Some(if kept.is_empty() { base.to_string() } else { format!("{base}?{}", kept.join("&")) })
-    }
-
     fn checkout(target: &EventLoopWindowTarget<Cmd>, id: u64, spec: CheckoutSpec) -> Result<Entry, String> {
         let window = window(target, &spec.title, 560.0, 840.0, false)?;
         let mut ctx = Box::new(WebContext::new(Some(spec.profile_dir.clone())));
@@ -500,48 +482,131 @@ mod imp {
     }
 }
 
-#[cfg(not(windows))]
-mod imp {
-    use super::{CheckoutSpec, SignInHandle, SignInSpec};
-
-    const UNSUPPORTED: &str = "as janelas nativas só existem no Windows; entre pelo app ou rode o servidor no Windows";
-
-    #[derive(Clone)]
-    pub struct Host;
-
-    pub struct Loop;
-
-    pub fn create() -> (Host, Loop) {
-        (Host, Loop)
+/// The sign-up URL without the Windows-hosted mode (`hosted`, `platform`, `uiflavor=win10host`,
+/// `cxh-*`), when `url` is Microsoft's sign-up in that mode.
+pub fn unhosted_signup(url: &str) -> Option<String> {
+    let (base, query) = url.split_once('?')?;
+    if !base.starts_with("https://signup.live.com/") {
+        return None;
     }
-
-    impl Host {
-        pub fn open_sign_in(&self, _spec: SignInSpec) -> Result<SignInHandle, String> {
-            Err(UNSUPPORTED.into())
-        }
-        pub fn open_checkout(&self, _spec: CheckoutSpec) -> Result<(), String> {
-            Err(UNSUPPORTED.into())
-        }
-        pub fn eval(&self, _win: u64, _js: String) {}
-        pub fn navigate(&self, _win: u64, _url: String) {}
-        pub fn load(&self, _win: u64, _url: String, _headers: Vec<(String, String)>) {}
-        pub fn close(&self, _win: u64) {}
-        pub async fn cdp(&self, _win: u64, _method: &str, _params: &str) -> Result<String, String> {
-            Err(UNSUPPORTED.into())
-        }
+    let hosted = |p: &&str| {
+        let k = p.split('=').next().unwrap_or("").to_ascii_lowercase();
+        k == "hosted" || k == "platform" || k == "uiflavor" || k.starts_with("cxh-")
+    };
+    if !query.split('&').any(|p| hosted(&p)) {
+        return None;
     }
+    let kept: Vec<&str> = query.split('&').filter(|p| !hosted(p)).collect();
+    Some(if kept.is_empty() { base.to_string() } else { format!("{base}?{}", kept.join("&")) })
+}
 
-    impl Loop {
-        /// Nothing to run here: the server is the whole program.
-        pub fn run(self) -> ! {
-            loop {
+/// The browser behind the windows. On Windows, the system's WebView2 in real windows (the default);
+/// everywhere (and by `XAU_BACKEND=chromium` on Windows), headless Chromium over DevTools, which
+/// needs no screen: that is what a server runs.
+#[derive(Clone)]
+pub enum Host {
+    #[cfg(windows)]
+    Native(imp::Host),
+    Cdp(crate::cdphost::Host),
+}
+
+/// What `main` runs on its thread: the native windows' event loop, or nothing.
+pub enum Loop {
+    #[cfg(windows)]
+    Native(imp::Loop),
+    Idle,
+}
+
+pub fn create() -> (Host, Loop) {
+    #[cfg(windows)]
+    if std::env::var("XAU_BACKEND").map_or(true, |b| b != "chromium") {
+        let (host, event_loop) = imp::create();
+        return (Host::Native(host), Loop::Native(event_loop));
+    }
+    (Host::Cdp(crate::cdphost::Host::new()), Loop::Idle)
+}
+
+impl Loop {
+    pub fn run(self) -> ! {
+        match self {
+            #[cfg(windows)]
+            Loop::Native(l) => l.run(),
+            Loop::Idle => loop {
                 std::thread::park();
-            }
+            },
         }
     }
 }
 
-pub use imp::{create, Host};
+impl Host {
+    /// Whether this server opens real windows on its own computer (the Store's purchase page too).
+    pub fn native(&self) -> bool {
+        match self {
+            #[cfg(windows)]
+            Host::Native(_) => true,
+            Host::Cdp(_) => false,
+        }
+    }
 
-/// Whether this build can open the native windows.
-pub const NATIVE: bool = cfg!(windows);
+    pub fn open_sign_in(&self, spec: SignInSpec) -> Result<SignInHandle, String> {
+        match self {
+            #[cfg(windows)]
+            Host::Native(h) => h.open_sign_in(spec),
+            Host::Cdp(h) => h.open_sign_in(spec),
+        }
+    }
+
+    pub fn open_checkout(&self, spec: CheckoutSpec) -> Result<(), String> {
+        match self {
+            #[cfg(windows)]
+            Host::Native(h) => h.open_checkout(spec),
+            Host::Cdp(_) => {
+                let _ = spec;
+                Err("este servidor não tem janelas: a compra abre a página pública do jogo".into())
+            }
+        }
+    }
+
+    pub fn eval(&self, win: u64, js: String) {
+        match self {
+            #[cfg(windows)]
+            Host::Native(h) => h.eval(win, js),
+            Host::Cdp(h) => h.eval(win, js),
+        }
+    }
+
+    pub fn navigate(&self, win: u64, url: String) {
+        match self {
+            #[cfg(windows)]
+            Host::Native(h) => h.navigate(win, url),
+            Host::Cdp(h) => h.navigate(win, url),
+        }
+    }
+
+    pub fn load(&self, win: u64, url: String, headers: Vec<(String, String)>) {
+        match self {
+            #[cfg(windows)]
+            Host::Native(h) => h.load(win, url, headers),
+            Host::Cdp(h) => {
+                let _ = headers;
+                h.load(win, url);
+            }
+        }
+    }
+
+    pub fn close(&self, win: u64) {
+        match self {
+            #[cfg(windows)]
+            Host::Native(h) => h.close(win),
+            Host::Cdp(h) => h.close(win),
+        }
+    }
+
+    pub async fn cdp(&self, win: u64, method: &str, params: &str) -> Result<String, String> {
+        match self {
+            #[cfg(windows)]
+            Host::Native(h) => h.cdp(win, method, params).await,
+            Host::Cdp(h) => h.cdp(win, method, params).await,
+        }
+    }
+}

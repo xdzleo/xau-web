@@ -8,6 +8,8 @@
 
 mod assets;
 mod auth;
+mod cdphost;
+mod egress;
 mod profiles;
 mod server;
 mod signin;
@@ -29,7 +31,15 @@ USAGE: xau-web [OPTIONS]
 
 The link it prints carries a key that only this installation knows. Anyone
 who has that link, or the web-key.txt in the data folder, controls the
-accounts, so keep both private.";
+accounts, so keep both private.
+
+As a server (a cloud host), it is set by the environment, not the options:
+
+  PORT                the port to listen on, on every interface (the host sets it)
+  XAU_PUBLIC_HOSTS    the domain names it answers to, comma separated (turns on server mode)
+  XAU_KEY             the access key (32+ characters); else one is made and kept in the data folder
+  XAU_DATA_DIR        where accounts and codes are kept (a persistent volume)
+  XAU_CHROMIUM        the browser that runs Microsoft's sign-in page (default: the usual places)";
 
 struct Args {
     port: u16,
@@ -87,19 +97,40 @@ fn main() {
         }
     };
 
-    let dir = args.data_dir.clone().unwrap_or_else(default_data_dir);
+    // On a server the environment says where it listens and what it is called.
+    let public_hosts: Vec<String> = std::env::var("XAU_PUBLIC_HOSTS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|h| h.trim().to_ascii_lowercase())
+        .filter(|h| !h.is_empty())
+        .collect();
+    let env_port: Option<u16> = std::env::var("PORT").ok().and_then(|p| p.parse().ok());
+    let server_mode = env_port.is_some() || !public_hosts.is_empty();
+    let args = Args { port: env_port.unwrap_or(args.port), open: args.open && !server_mode, ..args };
+
+    let dir = args
+        .data_dir
+        .clone()
+        .or_else(|| std::env::var_os("XAU_DATA_DIR").map(PathBuf::from))
+        .unwrap_or_else(default_data_dir);
     if let Err(e) = std::fs::create_dir_all(&dir) {
         eprintln!("não foi possível criar {}: {e}", dir.display());
         std::process::exit(1);
     }
     xau_mobile::accounts::set_data_dir(dir.clone());
-    let key = match auth::load_or_create_key(&dir) {
+    let key_from_env = auth::key_from_env();
+    let key = match key_from_env.clone().map_or_else(|| auth::load_or_create_key(&dir), Ok) {
         Ok(k) => k,
         Err(e) => {
             eprintln!("não foi possível guardar a chave em {}: {e}", dir.display());
             std::process::exit(1);
         }
     };
+
+    // Everything for Microsoft leaves through Cloudflare (WARP) when so configured, set before any
+    // other thread exists: the HTTP clients read it from the environment.
+    let egress = egress::Egress::from_env(server_mode);
+    egress.apply_to_environment();
 
     // The windows need the main thread; the server gets its own.
     let (host, event_loop) = webhost::create();
@@ -109,9 +140,11 @@ fn main() {
         .build()
         .expect("the async runtime");
 
-    let bind_ip = if args.lan { [0, 0, 0, 0] } else { [127, 0, 0, 1] };
+    let bind_ip = if args.lan || server_mode { [0, 0, 0, 0] } else { [127, 0, 0, 1] };
     let listener = runtime.block_on(async {
-        for port in args.port..args.port.saturating_add(10) {
+        // A server listens where it was told, and nowhere else; a computer takes the next free port.
+        let last = if server_mode { args.port } else { args.port.saturating_add(9) };
+        for port in args.port..=last {
             if let Ok(l) = tokio::net::TcpListener::bind(SocketAddr::from((bind_ip, port))).await {
                 return Some(l);
             }
@@ -127,27 +160,38 @@ fn main() {
     let app = server::App {
         key: Arc::new(key.clone()),
         port,
-        lan: args.lan,
+        access: auth::Access { lan: args.lan, hosts: Arc::new(public_hosts.clone()) },
         host,
+        egress: egress.clone(),
         logins: Arc::default(),
         checkout: Arc::default(),
     };
     let router = server::router(app);
 
-    let url = format!("http://localhost:{port}/?key={key}");
     println!("xau-web {} — a versão web do app", env!("CARGO_PKG_VERSION"));
     println!("  dados:    {}", dir.display());
-    println!("  abra:     {url}");
-    if args.lan {
-        println!("  na rede:  http://<ip deste computador>:{port}/?key={key}");
+    if server_mode {
+        println!("  saída:    {}", egress_note(&std::env::var("XAU_EGRESS_PROXY").unwrap_or_default()));
+        println!("  servidor: porta {port}, responde a: {}", if public_hosts.is_empty() { "localhost".to_string() } else { public_hosts.join(", ") });
+        if key_from_env.is_some() {
+            println!("  chave:    a de XAU_KEY (abra https://<domínio>/?key=<a chave> uma vez)");
+        } else {
+            println!("  chave:    {key}  (abra https://<domínio>/?key=<a chave> uma vez; defina XAU_KEY para não depender dos logs)");
+        }
+    } else {
+        let url = format!("http://localhost:{port}/?key={key}");
+        println!("  abra:     {url}");
+        if args.lan {
+            println!("  na rede:  http://<ip deste computador>:{port}/?key={key}");
+        }
+        println!("  (o link traz a chave: quem o tiver controla as contas)");
+        if args.open {
+            open_browser(&url);
+        }
     }
-    println!("  (o link traz a chave: quem o tiver controla as contas)");
-    if args.open {
-        open_browser(&url);
-    }
-
     std::thread::spawn(move || {
         runtime.block_on(async move {
+            tokio::spawn(egress.watch());
             if let Err(e) = axum::serve(listener, router).await {
                 eprintln!("o servidor parou: {e}");
                 std::process::exit(1);
@@ -165,4 +209,11 @@ fn init_logging() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).with_target(false).init();
+}
+fn egress_note(proxy: &str) -> String {
+    if proxy.is_empty() {
+        "SEM proxy: as chamadas à Microsoft ficam recusadas (configure o WARP, ou XAU_ALLOW_DIRECT_EGRESS=1 para testar)".into()
+    } else {
+        "tudo para a Microsoft sai pela Cloudflare (WARP), confirmado antes de cada uso".into()
+    }
 }

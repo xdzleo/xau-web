@@ -44,8 +44,8 @@ export async function startLogin() {
     show(stateBlock({ title, detail, actionLabel, onAction, tone: 'danger' }));
   };
 
-  if (S.info && !S.info.nativeWindows) {
-    failed('Não foi possível abrir o login', 'Esta versão do servidor só consegue abrir o login da Microsoft no Windows. Rode o xau-web no Windows para entrar.', 'Voltar', close);
+  if (S.info && !S.info.signIn) {
+    failed('Não foi possível abrir o login', 'Este servidor não consegue abrir o navegador do login (falta o Chromium ou o WebView2).', 'Voltar', close);
     return;
   }
 

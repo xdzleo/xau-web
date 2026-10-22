@@ -1,0 +1,9 @@
+target
+target-android
+android
+dist
+docs
+.git
+.github
+.claude
+**/*.apk

@@ -5,8 +5,10 @@
 //! `localhost`. Three independent checks, all of which must pass:
 //!
 //! 1. **Host**: the request must name this machine (`localhost`,
-//!    `127.0.0.1`, `[::1]`), which defeats DNS rebinding. With `--lan` any
-//!    name is accepted, and the key is the only gate.
+//!    `127.0.0.1`, `[::1]`), which defeats DNS rebinding. On a server open to
+//!    the internet (`XAU_PUBLIC_HOSTS`), the names of its own domain are
+//!    accepted too, and only those. With `--lan` any name is accepted, and the
+//!    key is the only gate.
 //! 2. **Key**: a random secret, kept in the data folder, carried by an
 //!    `HttpOnly; SameSite=Strict` cookie that only the printed link sets.
 //! 3. **Origin**: a browser-made POST must come from this very origin, and
@@ -52,49 +54,87 @@ fn host_of(h: &HeaderMap) -> Option<&str> {
     h.get(header::HOST).and_then(|v| v.to_str().ok())
 }
 
-pub fn host_ok(h: &HeaderMap, lan: bool) -> bool {
-    let Some(host) = host_of(h) else { return false };
-    if lan {
-        return true;
+/// Where the server is reachable, and so what a request may call it.
+#[derive(Clone, Default)]
+pub struct Access {
+    /// Any name is accepted (`--lan`): the key is the only gate.
+    pub lan: bool,
+    /// The domain names of a server open to the internet; empty on a computer.
+    pub hosts: std::sync::Arc<Vec<String>>,
+}
+
+impl Access {
+    /// A server behind a TLS proxy (the cloud): its own domain, reached over https.
+    pub fn public(&self) -> bool {
+        !self.hosts.is_empty()
     }
-    // `[::1]:8787` has colons of its own; the port is after the last one.
-    let name = host.rsplit_once(':').map_or(host, |(n, _)| n);
-    matches!(name, "localhost" | "127.0.0.1" | "[::1]")
-}
 
-pub fn cookie_name(port: u16) -> String {
-    format!("xau_key_{port}")
-}
+    pub fn host_ok(&self, h: &HeaderMap) -> bool {
+        let Some(host) = host_of(h) else { return false };
+        if self.lan {
+            return true;
+        }
+        // `[::1]:8787` has colons of its own; the port is after the last one.
+        let name = host.rsplit_once(':').map_or(host, |(n, _)| n);
+        matches!(name, "localhost" | "127.0.0.1" | "[::1]") || self.hosts.iter().any(|d| d.eq_ignore_ascii_case(name))
+    }
 
-pub fn cookie_ok(h: &HeaderMap, port: u16, key: &str) -> bool {
-    let want = cookie_name(port);
-    h.get_all(header::COOKIE)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(';'))
-        .filter_map(|kv| kv.trim().split_once('='))
-        .any(|(k, v)| k == want && same(v, key))
-}
+    /// ``https`` when the proxy in front says it terminated TLS, else ``http``. Trusted only on a
+    /// public server: there a request cannot reach us except through that proxy.
+    pub fn scheme(&self, h: &HeaderMap) -> &'static str {
+        let https = h.get("x-forwarded-proto").and_then(|v| v.to_str().ok()).is_some_and(|v| v.eq_ignore_ascii_case("https"));
+        if self.public() && https {
+            "https"
+        } else {
+            "http"
+        }
+    }
 
-/// A POST made by a page must come from this origin and carry `x-xau`.
-pub fn post_ok(h: &HeaderMap) -> bool {
-    let marked = h.get("x-xau").and_then(|v| v.to_str().ok()) == Some("1");
-    let origin_ok = match h.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
-        None => true,
-        Some(o) => host_of(h).is_some_and(|host| o == format!("http://{host}")),
-    };
-    marked && origin_ok
-}
+    pub fn cookie_name(&self, port: u16) -> String {
+        if self.public() {
+            "xau_key".to_string()
+        } else {
+            format!("xau_key_{port}")
+        }
+    }
 
-/// A WebSocket a page opens: browsers always send its Origin, and it must be this one
-/// (a cross-site page can open a WebSocket with the user's cookies otherwise).
-pub fn ws_origin_ok(h: &HeaderMap) -> bool {
-    match (h.get(header::ORIGIN).and_then(|v| v.to_str().ok()), host_of(h)) {
-        (Some(o), Some(host)) => o == format!("http://{host}"),
-        _ => false,
+    pub fn cookie_ok(&self, h: &HeaderMap, port: u16, key: &str) -> bool {
+        let want = self.cookie_name(port);
+        h.get_all(header::COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(';'))
+            .filter_map(|kv| kv.trim().split_once('='))
+            .any(|(k, v)| k == want && same(v, key))
+    }
+
+    fn origin_is_ours(&self, h: &HeaderMap, o: &str) -> bool {
+        host_of(h).is_some_and(|host| o == format!("{}://{host}", self.scheme(h)))
+    }
+
+    /// A POST made by a page must come from this origin and carry `x-xau`.
+    pub fn post_ok(&self, h: &HeaderMap) -> bool {
+        let marked = h.get("x-xau").and_then(|v| v.to_str().ok()) == Some("1");
+        let origin_ok = match h.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+            None => true,
+            Some(o) => self.origin_is_ours(h, o),
+        };
+        marked && origin_ok
+    }
+
+    /// A WebSocket a page opens: browsers always send its Origin, and it must be this one
+    /// (a cross-site page can open a WebSocket with the user's cookies otherwise).
+    pub fn ws_origin_ok(&self, h: &HeaderMap) -> bool {
+        h.get(header::ORIGIN).and_then(|v| v.to_str().ok()).is_some_and(|o| self.origin_is_ours(h, o))
     }
 }
 
+/// The key of this install, from the environment when it is set there (a cloud server
+/// keeps its secrets in variables), else the one kept in the data folder.
+pub fn key_from_env() -> Option<String> {
+    let k = std::env::var("XAU_KEY").ok()?.trim().to_string();
+    (k.len() >= 32 && k.bytes().all(|b| b.is_ascii_graphic())).then_some(k)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,44 +148,81 @@ mod tests {
         h
     }
 
+    fn local() -> Access {
+        Access::default()
+    }
+
+    fn lan() -> Access {
+        Access { lan: true, ..Access::default() }
+    }
+
+    fn public() -> Access {
+        Access { lan: false, hosts: std::sync::Arc::new(vec!["rewards.example.com".to_string()]) }
+    }
+
     #[test]
     fn only_this_machine_may_be_named() {
-        assert!(host_ok(&headers(&[("host", "localhost:8787")]), false));
-        assert!(host_ok(&headers(&[("host", "127.0.0.1:8787")]), false));
-        assert!(host_ok(&headers(&[("host", "[::1]:8787")]), false));
-        assert!(!host_ok(&headers(&[("host", "evil.example:8787")]), false), "DNS rebinding");
-        assert!(!host_ok(&headers(&[("host", "localhost.evil.example")]), false));
-        assert!(!host_ok(&HeaderMap::new(), false));
-        assert!(host_ok(&headers(&[("host", "192.168.0.5:8787")]), true), "--lan");
+        assert!(local().host_ok(&headers(&[("host", "localhost:8787")])));
+        assert!(local().host_ok(&headers(&[("host", "127.0.0.1:8787")])));
+        assert!(local().host_ok(&headers(&[("host", "[::1]:8787")])));
+        assert!(!local().host_ok(&headers(&[("host", "evil.example:8787")])), "DNS rebinding");
+        assert!(!local().host_ok(&headers(&[("host", "localhost.evil.example")])));
+        assert!(!local().host_ok(&HeaderMap::new()));
+        assert!(lan().host_ok(&headers(&[("host", "192.168.0.5:8787")])), "--lan");
+    }
+
+    #[test]
+    fn a_public_server_answers_to_its_own_domain_only() {
+        assert!(public().host_ok(&headers(&[("host", "rewards.example.com")])));
+        assert!(public().host_ok(&headers(&[("host", "Rewards.Example.com")])));
+        assert!(!public().host_ok(&headers(&[("host", "evil.example.com")])));
+        assert!(!public().host_ok(&headers(&[("host", "rewards.example.com.evil.net")])));
+        assert!(!public().host_ok(&headers(&[("host", "xrewards.example.com")])));
     }
 
     #[test]
     fn the_cookie_must_carry_this_ports_key() {
         let key = new_key();
         let h = headers(&[("cookie", &format!("a=b; xau_key_8787={key}; c=d"))]);
-        assert!(cookie_ok(&h, 8787, &key));
-        assert!(!cookie_ok(&h, 8788, &key), "another instance's cookie is not ours");
-        assert!(!cookie_ok(&h, 8787, &new_key()));
-        assert!(!cookie_ok(&HeaderMap::new(), 8787, &key));
+        assert!(local().cookie_ok(&h, 8787, &key));
+        assert!(!local().cookie_ok(&h, 8788, &key), "another instance's cookie is not ours");
+        assert!(!local().cookie_ok(&h, 8787, &new_key()));
+        assert!(!local().cookie_ok(&HeaderMap::new(), 8787, &key));
+        // On a public server the port is the proxy's business: one name, whatever the port.
+        let p = headers(&[("cookie", &format!("xau_key={key}"))]);
+        assert!(public().cookie_ok(&p, 8080, &key) && public().cookie_ok(&p, 3000, &key));
     }
 
     #[test]
     fn a_post_needs_the_marker_and_the_same_origin() {
         let ok = headers(&[("host", "localhost:8787"), ("origin", "http://localhost:8787"), ("x-xau", "1")]);
-        assert!(post_ok(&ok));
+        assert!(local().post_ok(&ok));
         let cross = headers(&[("host", "localhost:8787"), ("origin", "https://evil.example"), ("x-xau", "1")]);
-        assert!(!post_ok(&cross));
+        assert!(!local().post_ok(&cross));
         let unmarked = headers(&[("host", "localhost:8787"), ("origin", "http://localhost:8787")]);
-        assert!(!post_ok(&unmarked));
+        assert!(!local().post_ok(&unmarked));
+    }
+
+    #[test]
+    fn behind_the_proxy_the_origin_is_https() {
+        let h = |origin: &str, proto: &str| {
+            headers(&[("host", "rewards.example.com"), ("origin", origin), ("x-xau", "1"), ("x-forwarded-proto", proto)])
+        };
+        assert!(public().post_ok(&h("https://rewards.example.com", "https")));
+        assert!(!public().post_ok(&h("http://rewards.example.com", "https")), "the page is https: an http origin is not it");
+        assert!(!public().post_ok(&h("https://evil.example", "https")));
+        // A computer's server never believes the header: there is no proxy in front of it.
+        assert!(!local().post_ok(&headers(&[("host", "localhost:8787"), ("origin", "https://localhost:8787"), ("x-xau", "1"), ("x-forwarded-proto", "https")])));
     }
 
     #[test]
     fn a_websocket_needs_this_origin() {
-        assert!(ws_origin_ok(&headers(&[("host", "localhost:8787"), ("origin", "http://localhost:8787")])));
-        assert!(!ws_origin_ok(&headers(&[("host", "localhost:8787"), ("origin", "https://evil.example")])));
-        assert!(!ws_origin_ok(&headers(&[("host", "localhost:8787")])));
+        assert!(local().ws_origin_ok(&headers(&[("host", "localhost:8787"), ("origin", "http://localhost:8787")])));
+        assert!(!local().ws_origin_ok(&headers(&[("host", "localhost:8787"), ("origin", "https://evil.example")])));
+        assert!(!local().ws_origin_ok(&headers(&[("host", "localhost:8787")])));
+        let p = headers(&[("host", "rewards.example.com"), ("origin", "https://rewards.example.com"), ("x-forwarded-proto", "https")]);
+        assert!(public().ws_origin_ok(&p));
     }
-
     #[test]
     fn keys_are_random_hex_and_compared_whole() {
         let (a, b) = (new_key(), new_key());
