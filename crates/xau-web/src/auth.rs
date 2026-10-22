@@ -50,6 +50,25 @@ pub fn same(a: &str, b: &str) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+/// The shortest password accepted.
+pub const MIN_PASSWORD: usize = 4;
+
+/// The site's passwords, from `XAU_PASSWORD`: one or several, separated by commas or new lines
+/// (spaces around each are dropped, so a password cannot hold a comma). Any of them opens the site.
+pub fn passwords_from(raw: &str) -> Result<Vec<String>, String> {
+    let list: Vec<String> = raw.split([',', '\n']).map(str::trim).filter(|p| !p.is_empty()).map(str::to_string).collect();
+    if let Some(n) = list.iter().position(|p| p.chars().count() < MIN_PASSWORD) {
+        return Err(format!("a senha nº {} de XAU_PASSWORD tem menos de {MIN_PASSWORD} caracteres", n + 1));
+    }
+    Ok(list)
+}
+
+/// Whether `given` is one of `passwords`. Every one is compared, so the time taken does not say
+/// which matched or how far down the list it is.
+pub fn any_same(given: &str, passwords: &[String]) -> bool {
+    passwords.iter().fold(false, |hit, p| same(given, p) | hit)
+}
+
 fn host_of(h: &HeaderMap) -> Option<&str> {
     h.get(header::HOST).and_then(|v| v.to_str().ok())
 }
@@ -219,6 +238,19 @@ pub fn key_from_env() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn several_passwords_each_at_least_four_characters() {
+        assert_eq!(passwords_from("abcd").unwrap(), ["abcd"]);
+        assert_eq!(passwords_from(" uma-senha , outra ,\nterceira, ").unwrap(), ["uma-senha", "outra", "terceira"]);
+        assert!(passwords_from("ok12,abc").unwrap_err().contains("nº 2"));
+        assert!(passwords_from(" , ").unwrap().is_empty());
+        let list = passwords_from("primeira,segunda").unwrap();
+        assert!(any_same("segunda", &list));
+        assert!(any_same("primeira", &list));
+        assert!(!any_same("terceira", &list));
+        assert!(!any_same("", &list));
+    }
     use axum::http::HeaderValue;
 
     fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {

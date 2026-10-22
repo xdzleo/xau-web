@@ -41,7 +41,7 @@ O túnel vai por **HTTP/2 sobre TCP** (não depende de UDP). `XAU_WARP_TRANSPORT
 | Variável | Valor | Para quê |
 |---|---|---|
 | `XAU_PUBLIC_HOSTS` | `rewardsxb.site` | o nome pelo qual o servidor responde (outros nomes são recusados) |
-| `XAU_PASSWORD` | a senha que você vai digitar (10+ caracteres) | pedida na página inicial; quem a tem controla as contas |
+| `XAU_PASSWORD` | uma senha, ou várias separadas por vírgula (`senha1,senha2,senha3`), cada uma com 4+ caracteres | pedida na página inicial; qualquer uma delas entra, e quem a tem controla as contas |
 
    O Railway já define `PORT`. Não defina `XAU_ALLOW_DIRECT_EGRESS`: ele existe só para testes e
    desliga a regra da saída pela Cloudflare.
@@ -85,7 +85,7 @@ Abra `https://rewardsxb.site/`, digite a senha e entre (o navegador guarda o ace
 |---|---|
 | `PORT` | porta de escuta, em todas as interfaces (o host define) |
 | `XAU_PUBLIC_HOSTS` | nomes aceitos, separados por vírgula; liga o modo servidor |
-| `XAU_PASSWORD` | a senha pedida na página inicial (10+ caracteres) |
+| `XAU_PASSWORD` | a senha pedida na página inicial; várias separadas por vírgula, qualquer uma entra (4+ caracteres cada, sem vírgula dentro) |
 | `XAU_KEY` | (opcional) a chave da sessão e do link de emergência; sem ela, uma é criada em `/data/web-key.txt` e aparece nos logs |
 | `XAU_DATA_DIR` | pasta de dados (o volume), `/data` na imagem |
 | `XAU_EGRESS_PROXY` | proxy de saída; sem ela, o entrypoint sobe o usque e usa `socks5h://127.0.0.1:40000` |

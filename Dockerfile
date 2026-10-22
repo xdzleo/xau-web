@@ -2,7 +2,7 @@
 #
 #   docker build -t xau-web .
 #   docker run -p 8080:8080 -v xau-data:/data \
-#     -e PORT=8080 -e XAU_PUBLIC_HOSTS=rewards.example.com -e XAU_PASSWORD=<10+ chars> xau-web
+#     -e PORT=8080 -e XAU_PUBLIC_HOSTS=rewards.example.com -e XAU_PASSWORD=<one,or,several> xau-web
 #
 # One container holds the server, the headless Chromium that runs Microsoft's sign-in page, and
 # a Cloudflare WARP proxy, through which everything meant for Microsoft leaves (see
