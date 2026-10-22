@@ -399,18 +399,58 @@ function presenceProblem(a) {
 
 // ------------------------------------------------------------- welcome
 
+// Microsoft's four squares, for the sign-in button.
+const MS_MARK =
+  '<svg viewBox="0 0 21 21" aria-hidden="true"><rect x="1" y="1" width="9" height="9" fill="#f25022"/><rect x="11" y="1" width="9" height="9" fill="#7fba00"/><rect x="1" y="11" width="9" height="9" fill="#00a4ef"/><rect x="11" y="11" width="9" height="9" fill="#ffb900"/></svg>';
+
+const FEATURES = [
+  ['bars', 'Saldo do Rewards', 'Todas as contas num lugar só'],
+  ['check', 'Resgate na hora', 'Pontos pendentes, com um toque'],
+  ['pad', 'Farm de presença', '8 jogos contando por você'],
+];
+
 function welcome(enter) {
+  // Each part comes in a beat after the one before (only on the first paint).
+  let beat = 0;
+  const rise = (el) => wrapRise(enter, beat++, el);
+  const mark = h('span', { class: 'ms-mark' });
+  mark.innerHTML = MS_MARK;
   return h(
     'div',
     { class: 'welcome' },
-    h('div', { class: `logo big${enter ? ' rise' : ''}` }, icon('xbox')),
-    h('h1', null, 'Xbox ', h('span', { class: 'green' }, 'Rewards')),
-    h('div', { class: 't2' }, 'Jogos. Presença. Recompensas.'),
+    h('div', { class: 'aurora', 'aria-hidden': 'true' }, h('i'), h('i'), h('i')),
+    h('div', { class: 'grid-fade', 'aria-hidden': 'true' }),
     h(
-      'p',
-      { class: S.fatal ? 'danger' : 't2', style: { margin: '32px 0 24px' } },
-      S.fatal || 'Entre com a sua conta Microsoft para ver o saldo do Rewards, resgatar os pontos pendentes e rodar o farm de presença.',
+      'div',
+      { class: 'welcome-in' },
+      rise(h('div', { class: 'orb' }, h('div', { class: 'orb-ring' }), h('div', { class: 'orb-halo' }), h('div', { class: 'logo big' }, icon('xbox')))),
+      rise(h('div', { class: 'eyebrow welcome-eyebrow' }, 'Microsoft Rewards no Xbox')),
+      rise(h('h1', null, 'Xbox ', h('span', { class: 'shine' }, 'Rewards'))),
+      rise(h('div', { class: 'tagline' }, 'Jogos. Presença. ', h('b', null, 'Recompensas.'))),
+      rise(
+        h(
+          'div',
+          { class: 'feats' },
+          ...FEATURES.map(([ic, title, sub]) =>
+            h('div', { class: 'feat' }, h('div', { class: 'feat-ic' }, icon(ic)), h('div', { class: 'feat-t' }, title), h('div', { class: 'feat-s' }, sub)),
+          ),
+        ),
+      ),
+      rise(
+        h(
+          'div',
+          { class: 'cta' },
+          S.fatal ? h('p', { class: 'danger cta-msg' }, S.fatal) : null,
+          h(
+            'button',
+            { class: 'btn ms-btn', onClick: () => startLogin() },
+            mark,
+            h('span', null, S.fatal ? 'Tentar de novo' : 'Entrar com a Microsoft'),
+            h('span', { class: 'ms-arrow', 'aria-hidden': 'true' }, '→'),
+          ),
+          h('div', { class: 'cta-note' }, icon('lock'), 'O login acontece na página da própria Microsoft'),
+        ),
+      ),
     ),
-    h('button', { class: 'btn primary lg', onClick: () => startLogin() }, S.fatal ? 'Tentar de novo' : 'Entrar com a Microsoft'),
   );
 }
