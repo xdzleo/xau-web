@@ -64,9 +64,24 @@ EOF
   log "warp-svc log (last lines):"
   tail -n 25 /var/log/warp-svc.log 2> /dev/null | sed 's/^/[warp-svc] /' || true
   (
+    seen=$(wc -l < /var/log/warp-svc.log 2> /dev/null || echo 0)
+    n=0
     while true; do
-      sleep 60
-      echo "[warp] $(warp-cli --accept-tos status 2>&1 | tr '\n' ' ') | proxy port ${WARP_PORT}: $(nc -z 127.0.0.1 "${WARP_PORT}" 2> /dev/null && echo listening || echo NOT listening)"
+      sleep 15
+      # What warp-svc said since the last look: status changes, warnings and errors, without the
+      # per-packet debug noise.
+      now=$(wc -l < /var/log/warp-svc.log 2> /dev/null || echo 0)
+      [ "$now" -lt "$seen" ] && seen=0
+      if [ "$now" -gt "$seen" ]; then
+        tail -n +"$((seen + 1))" /var/log/warp-svc.log | head -n "$((now - seen))" \
+          | grep -E ' (WARN|ERROR) |Ipc Broadcast ResponseStatus|Disconnect|disconnect|Reason|closed|timed out|timeout' \
+          | grep -v -E 'slog\.|time\.busy' | cut -c1-300 | tail -n 30 | sed 's/^/[warp-svc] /'
+        seen=$now
+      fi
+      n=$((n + 1))
+      if [ $((n % 4)) -eq 0 ]; then
+        echo "[warp] $(warp-cli --accept-tos status 2>&1 | tr '\n' ' ') | proxy port ${WARP_PORT}: $(nc -z 127.0.0.1 "${WARP_PORT}" 2> /dev/null && echo listening || echo NOT listening)"
+      fi
     done
   ) &
   export XAU_EGRESS_PROXY="socks5h://127.0.0.1:${WARP_PORT}"
