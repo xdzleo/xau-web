@@ -65,7 +65,7 @@ fn shared_telemetry_client() -> Result<&'static Client> {
     // not even exist there — so it takes reqwest's default. Selecting the
     // backend per target rather than gating the whole module keeps
     // `XboxClient`, which holds an events bundle, compiling on both.
-    #[cfg(not(target_os = "android"))]
+    #[cfg(windows)]
     let builder = builder.use_native_tls();
     let built = builder
         .build()
