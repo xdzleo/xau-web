@@ -37,8 +37,15 @@ EOF
 
   rm -f /run/dbus/pid
   dbus-daemon --system --fork || log "dbus did not start (WARP may still work)"
-  warp-svc > /var/log/warp-svc.log 2>&1 &
-  sleep 2
+  # warp-svc is kept alive: if it falls over, it is started again (it reads mdm.xml each time).
+  (
+    while true; do
+      warp-svc >> /var/log/warp-svc.log 2>&1
+      echo "[entrypoint] warp-svc exited (code $?); starting it again in 3 s"
+      sleep 3
+    done
+  ) &
+  sleep 3
   warp-cli --accept-tos status > /dev/null 2>&1 || true
 
   i=0
@@ -52,6 +59,16 @@ EOF
     sleep 1
   done
 
+  # What WARP says, once now and then every minute, so the logs show why it is or is not up.
+  log "warp-cli status: $(warp-cli --accept-tos status 2>&1 | tr '\n' ' ')"
+  log "warp-svc log (last lines):"
+  tail -n 25 /var/log/warp-svc.log 2> /dev/null | sed 's/^/[warp-svc] /' || true
+  (
+    while true; do
+      sleep 60
+      echo "[warp] $(warp-cli --accept-tos status 2>&1 | tr '\n' ' ') | proxy port ${WARP_PORT}: $(nc -z 127.0.0.1 "${WARP_PORT}" 2> /dev/null && echo listening || echo NOT listening)"
+    done
+  ) &
   export XAU_EGRESS_PROXY="socks5h://127.0.0.1:${WARP_PORT}"
 else
   log "WARP is not configured (WARP_TEAM, WARP_CLIENT_ID, WARP_CLIENT_SECRET): calls to Microsoft will be refused"
