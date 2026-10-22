@@ -4,7 +4,7 @@
 # (a PORT, a public host, a key), its health check answers, and the headless Chromium inside it
 # opens the local benchmark page and sends back a frame (a JPEG), through the same DevTools path
 # that runs Microsoft's sign-in page. Nothing here talks to Microsoft, and WARP is not started
-# (it needs the Zero Trust secrets): the server's refusal to call Microsoft without it is tested.
+# (XAU_WARP=off, so CI does not register WARP devices): the refusal to call Microsoft without it is tested.
 name: web
 
 on:
@@ -50,7 +50,9 @@ jobs:
             -e XAU_PASSWORD=senha-de-teste-do-ci \
             -e XAU_KEY=0123456789abcdef0123456789abcdef0123456789abcdef \
             -e XAU_WEB_BENCH=1 \
+            -e XAU_WARP=off \
             xau-web:ci
+          docker run --rm --entrypoint usque xau-web:ci --help | head -n 3
           for i in $(seq 1 60); do
             if curl -fsS http://localhost:8080/healthz > /dev/null 2>&1; then break; fi
             sleep 1
