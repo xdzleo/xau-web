@@ -43,6 +43,7 @@ RUN chmod +x /entrypoint.sh
 ENV XAU_CHROMIUM=/usr/bin/chromium \
     XAU_CHROMIUM_NO_SANDBOX=1 \
     XAU_DATA_DIR=/data
-VOLUME /data
+# The data folder is a volume, but not declared here: Railway refuses VOLUME in a Dockerfile. Its volume
+# (mount path /data, see docs/DEPLOY-RAILWAY.md) is made in the Railway panel; elsewhere use -v xau-data:/data.
 EXPOSE 8080
 ENTRYPOINT ["/entrypoint.sh"]
