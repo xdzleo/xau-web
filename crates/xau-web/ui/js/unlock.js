@@ -1,4 +1,9 @@
-﻿// The password page: send the password, and the server answers with the session cookie.
+// The password page: send the password, and the server answers with the session cookie.
+import { ICONS } from './icons.js';
+
+// The app's own Xbox mark (the same constant the app draws), not a copy of it.
+document.getElementById('ic').innerHTML = ICONS.xbox;
+
 const form = document.getElementById('f');
 const pw = document.getElementById('pw');
 const msg = document.getElementById('msg');
