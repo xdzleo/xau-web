@@ -21,8 +21,9 @@ pub struct App {
     pub port: u16,
     pub access: auth::Access,
     pub egress: Arc<crate::egress::Egress>,
-    /// The password a person types to get the session cookie (None: only the key link opens it).
-    pub password: Option<Arc<String>>,
+    /// The passwords, any of which a person can type to get the session cookie (None: only the key
+    /// link opens it).
+    pub password: Option<Arc<Vec<String>>>,
     pub throttle: Arc<auth::Throttle>,
     pub host: Host,
     pub logins: Arc<Logins>,
@@ -108,7 +109,7 @@ fn session_cookie(app: &App, h: &HeaderMap) -> String {
     format!("{}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age=31536000{secure_flag}", app.access.cookie_name(app.port), app.key)
 }
 
-/// The password page's request: the right password gets the session cookie. Wrong ones wait a
+/// The password page's request: a right password (any of them) gets the session cookie. Wrong ones wait a
 /// moment and count against the address and the server (see `auth::Throttle`).
 async fn unlock(State(app): State<App>, h: HeaderMap, body: Bytes) -> Response {
     if !app.access.host_ok(&h) {
@@ -128,7 +129,7 @@ async fn unlock(State(app): State<App>, h: HeaderMap, body: Bytes) -> Response {
         .ok()
         .and_then(|v| v["password"].as_str().map(str::to_string))
         .unwrap_or_default();
-    if auth::same(&given, &password) {
+    if auth::any_same(&given, &password) {
         app.throttle.clear(&ip);
         let mut r = ok(json!({}));
         if let Ok(c) = HeaderValue::from_str(&session_cookie(&app, &h)) {

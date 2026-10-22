@@ -37,7 +37,8 @@ As a server (a cloud host), it is set by the environment, not the options:
 
   PORT                the port to listen on, on every interface (the host sets it)
   XAU_PUBLIC_HOSTS    the domain names it answers to, comma separated (turns on server mode)
-  XAU_PASSWORD        the password the front page asks for (10+ characters)
+  XAU_PASSWORD        the password(s) the front page asks for: one, or several separated
+                      by commas, any of which opens the site (4+ characters each)
   XAU_KEY             the session key (32+ characters); else one is made and kept in the data folder
   XAU_DATA_DIR        where accounts and codes are kept (a persistent volume)
   XAU_CHROMIUM        the browser that runs Microsoft's sign-in page (default: the usual places)";
@@ -119,11 +120,13 @@ fn main() {
         std::process::exit(1);
     }
     xau_mobile::accounts::set_data_dir(dir.clone());
-    let password = std::env::var("XAU_PASSWORD").ok().map(|p| p.trim().to_string()).filter(|p| !p.is_empty());
-    if password.as_ref().is_some_and(|p| p.chars().count() < 10) {
-        eprintln!("XAU_PASSWORD precisa de pelo menos 10 caracteres");
-        std::process::exit(2);
-    }
+    let password = match auth::passwords_from(&std::env::var("XAU_PASSWORD").unwrap_or_default()) {
+        Ok(list) => Some(list).filter(|l| !l.is_empty()),
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    };
     let key_from_env = auth::key_from_env();
     let key = match key_from_env.clone().map_or_else(|| auth::load_or_create_key(&dir), Ok) {
         Ok(k) => k,
@@ -181,8 +184,9 @@ fn main() {
     if server_mode {
         println!("  saída:    {}", egress_note(&std::env::var("XAU_EGRESS_PROXY").unwrap_or_default()));
         println!("  servidor: porta {port}, responde a: {}", if public_hosts.is_empty() { "localhost".to_string() } else { public_hosts.join(", ") });
-        if password.is_some() {
-            println!("  acesso:   a senha (XAU_PASSWORD), pedida na página inicial; tentativas limitadas");
+        if let Some(list) = &password {
+            let which = if list.len() == 1 { "a senha".to_string() } else { format!("qualquer uma das {} senhas", list.len()) };
+            println!("  acesso:   {which} (XAU_PASSWORD), pedida na página inicial; tentativas limitadas");
         } else if key_from_env.is_some() {
             println!("  chave:    a de XAU_KEY (abra https://<domínio>/?key=<a chave> uma vez)");
         } else {
