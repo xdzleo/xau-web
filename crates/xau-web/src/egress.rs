@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -27,6 +27,8 @@ pub struct State {
     pub colo: String,
     pub warp: String,
     pub detail: String,
+    /// When the proxy last answered with a confirmed Cloudflare exit.
+    pub last_ok: Option<Instant>,
 }
 
 pub struct Egress {
@@ -98,29 +100,45 @@ impl Egress {
         json!({ "required": self.required, "proxy": self.proxy.is_some(), "ok": s.ok || !self.required, "colo": s.colo, "warp": s.warp, "ip": s.ip, "detail": s.detail })
     }
 
-    async fn check_once(&self) -> Result<State, String> {
+    async fn check_once(&self) -> Result<State, Fault> {
         let url = std::env::var("XAU_EGRESS_TRACE_URL").unwrap_or_else(|_| TRACE.to_string());
-        let proxy = reqwest::Proxy::all(self.proxy.as_deref().ok_or("sem proxy")?).map_err(|e| format!("proxy inválido: {e}"))?;
-        let via = reqwest::Client::builder().no_proxy().proxy(proxy).timeout(Duration::from_secs(15)).build().map_err(|e| e.to_string())?;
-        let body = via.get(&url).send().await.map_err(|e| format!("o proxy não respondeu: {e}"))?.text().await.map_err(|e| e.to_string())?;
+        let transport = |e: String| Fault::Transport(e);
+        let proxy = reqwest::Proxy::all(self.proxy.as_deref().ok_or_else(|| transport("sem proxy".into()))?)
+            .map_err(|e| transport(format!("proxy inválido: {e}")))?;
+        let via = reqwest::Client::builder().no_proxy().proxy(proxy).timeout(Duration::from_secs(15)).build().map_err(|e| transport(e.to_string()))?;
+        let body = via
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| transport(format!("o proxy não respondeu: {e}")))?
+            .text()
+            .await
+            .map_err(|e| transport(e.to_string()))?;
         let trace = parse_trace(&body);
         // The same request without the proxy: it must not come out of the same address.
-        let direct = reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(6)).build().map_err(|e| e.to_string())?;
+        let direct = reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(6)).build().map_err(|e| transport(e.to_string()))?;
         let direct_ip = match direct.get(&url).send().await {
             Ok(r) => r.text().await.ok().map(|b| parse_trace(&b)).and_then(|t| t.get("ip").cloned()),
             Err(_) => None,
         };
-        judge(&trace, direct_ip.as_deref())?;
+        judge(&trace, direct_ip.as_deref()).map_err(Fault::Verdict)?;
         Ok(State {
             ok: true,
             ip: trace.get("ip").cloned().unwrap_or_default(),
             colo: trace.get("colo").cloned().unwrap_or_default(),
             warp: trace.get("warp").cloned().unwrap_or_default(),
             detail: String::new(),
+            last_ok: Some(Instant::now()),
         })
     }
 
-    /// Keep the check going for the life of the server; a failure closes the door at once.
+    /// Keep the check going for the life of the server. Often (every few seconds) because an idle
+    /// WARP tunnel can fall asleep and then take a while to wake: the checks are also its keep-alive.
+    ///
+    /// A verdict that the exit is not Cloudflare's closes the door at once. A proxy that does not
+    /// answer closes it only if it has not answered for a while (`GRACE`): a short stumble must not
+    /// make the site flap, and nothing leaks meanwhile, since every client goes through that proxy
+    /// and fails when it is down, never around it.
     pub async fn watch(self: Arc<Self>) {
         if self.proxy.is_none() {
             return;
@@ -133,12 +151,20 @@ impl Egress {
                         tracing::info!("saída pela Cloudflare confirmada (warp={}, colo={})", s.warp, s.colo);
                     }
                     *self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = s;
-                    Duration::from_secs(30)
+                    CHECK_EVERY
                 }
-                Err(e) => {
-                    tracing::warn!("saída pela Cloudflare: {e}");
-                    *self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = State { detail: e, ..State::default() };
-                    Duration::from_secs(5)
+                Err(fault) => {
+                    let mut st = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let (detail, keeps_trust) = match fault {
+                        Fault::Transport(e) => (e, still_trusted(st.last_ok, Instant::now())),
+                        Fault::Verdict(e) => (e, false),
+                    };
+                    tracing::warn!("saída pela Cloudflare: {detail}{}", if keeps_trust { " (ainda dentro da tolerância)" } else { "" });
+                    st.detail = detail;
+                    if !keeps_trust {
+                        st.ok = false;
+                    }
+                    RETRY_EVERY
                 }
             };
             tokio::time::sleep(wait).await;
@@ -146,6 +172,21 @@ impl Egress {
     }
 }
 
+/// Why a check failed: the proxy did not answer (`Transport`), or it answered and the exit is not
+/// Cloudflare's (`Verdict`).
+enum Fault {
+    Transport(String),
+    Verdict(String),
+}
+
+const CHECK_EVERY: Duration = Duration::from_secs(10);
+const RETRY_EVERY: Duration = Duration::from_secs(3);
+/// How long a proxy that stopped answering keeps the confirmation it earned.
+const GRACE: Duration = Duration::from_secs(45);
+
+fn still_trusted(last_ok: Option<Instant>, now: Instant) -> bool {
+    last_ok.is_some_and(|t| now.saturating_duration_since(t) < GRACE)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,6 +209,14 @@ mod tests {
         assert!(judge(&trace("ip=1.1.1.1\nwarp=off\ngateway=on"), None).is_ok());
         assert!(judge(&trace("ip=1.1.1.1\nwarp=off\ngateway=off"), None).is_err(), "a plain datacenter address");
         assert!(judge(&trace("ip=1.1.1.1"), None).is_err(), "no field at all");
+    }
+
+    #[test]
+    fn a_short_stumble_keeps_the_confirmation_a_long_silence_does_not() {
+        let now = Instant::now();
+        assert!(still_trusted(Some(now), now + Duration::from_secs(20)));
+        assert!(!still_trusted(Some(now), now + GRACE + Duration::from_secs(1)));
+        assert!(!still_trusted(None, now), "never confirmed: never trusted");
     }
 
     #[test]
