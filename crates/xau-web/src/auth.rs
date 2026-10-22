@@ -129,6 +129,87 @@ impl Access {
     }
 }
 
+/// Limits how fast a password can be guessed: a few wrong tries per address, and a lower
+/// ceiling for the whole server (an attacker can invent addresses, a proxy header is not proof).
+/// Past either, attempts are refused (even a right password) until it clears. The key link in the
+/// server's logs remains the way in if the owner is locked out by someone else's guessing.
+#[derive(Default)]
+pub struct Throttle {
+    inner: std::sync::Mutex<ThrottleState>,
+}
+
+#[derive(Default)]
+struct ThrottleState {
+    per: std::collections::HashMap<String, Vec<std::time::Instant>>,
+    all: Vec<std::time::Instant>,
+    locked_until: Option<std::time::Instant>,
+}
+
+const PER_ADDRESS: usize = 5;
+const PER_ADDRESS_WINDOW: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+const ALL_ADDRESSES: usize = 20;
+const ALL_WINDOW: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+const LOCK: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+impl Throttle {
+    fn lock(&self) -> std::sync::MutexGuard<'_, ThrottleState> {
+        self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// `Ok` when this address may try now; else how long until it may.
+    pub fn check(&self, ip: &str) -> Result<(), std::time::Duration> {
+        self.check_at(ip, std::time::Instant::now())
+    }
+
+    pub fn fail(&self, ip: &str) {
+        self.fail_at(ip, std::time::Instant::now());
+    }
+
+    pub fn clear(&self, ip: &str) {
+        self.lock().per.remove(ip);
+    }
+
+    fn check_at(&self, ip: &str, now: std::time::Instant) -> Result<(), std::time::Duration> {
+        let mut s = self.lock();
+        if let Some(until) = s.locked_until {
+            if until > now {
+                return Err(until - now);
+            }
+            s.locked_until = None;
+            s.all.clear();
+        }
+        s.all.retain(|t| now.duration_since(*t) < ALL_WINDOW);
+        if s.all.len() >= ALL_ADDRESSES {
+            s.locked_until = Some(now + LOCK);
+            return Err(LOCK);
+        }
+        if let Some(v) = s.per.get_mut(ip) {
+            v.retain(|t| now.duration_since(*t) < PER_ADDRESS_WINDOW);
+            if v.len() >= PER_ADDRESS {
+                let oldest = v.iter().min().copied().unwrap_or(now);
+                return Err((oldest + PER_ADDRESS_WINDOW).saturating_duration_since(now));
+            }
+        }
+        Ok(())
+    }
+
+    fn fail_at(&self, ip: &str, now: std::time::Instant) {
+        let mut s = self.lock();
+        s.per.entry(ip.to_string()).or_default().push(now);
+        s.all.push(now);
+        // The table must not grow with every address ever seen.
+        if s.per.len() > 4096 {
+            s.per.retain(|_, v| v.iter().any(|t| now.duration_since(*t) < PER_ADDRESS_WINDOW));
+        }
+    }
+}
+
+/// The caller's address as the proxies in front report it (Cloudflare, then the host's own).
+pub fn client_ip(h: &HeaderMap) -> String {
+    let get = |k: &str| h.get(k).and_then(|v| v.to_str().ok()).map(|v| v.split(',').next().unwrap_or("").trim().to_string());
+    get("cf-connecting-ip").or_else(|| get("x-forwarded-for")).filter(|s| !s.is_empty()).unwrap_or_else(|| "local".into())
+}
+
 /// The key of this install, from the environment when it is set there (a cloud server
 /// keeps its secrets in variables), else the one kept in the data folder.
 pub fn key_from_env() -> Option<String> {
@@ -223,6 +304,38 @@ mod tests {
         let p = headers(&[("host", "rewards.example.com"), ("origin", "https://rewards.example.com"), ("x-forwarded-proto", "https")]);
         assert!(public().ws_origin_ok(&p));
     }
+    #[test]
+    fn guessing_is_limited_per_address_and_overall() {
+        let t = Throttle::default();
+        let now = std::time::Instant::now();
+        assert!(t.check_at("1.1.1.1", now).is_ok());
+        for _ in 0..PER_ADDRESS {
+            t.fail_at("1.1.1.1", now);
+        }
+        assert!(t.check_at("1.1.1.1", now).is_err(), "five wrong tries close this address");
+        assert!(t.check_at("2.2.2.2", now).is_ok(), "another address is not affected");
+        // The window passes.
+        assert!(t.check_at("1.1.1.1", now + PER_ADDRESS_WINDOW + std::time::Duration::from_secs(1)).is_ok());
+        // A clear after a right password.
+        t.clear("1.1.1.1");
+        assert!(t.check_at("1.1.1.1", now).is_ok());
+
+        // Many addresses: the whole server closes.
+        let t = Throttle::default();
+        for i in 0..ALL_ADDRESSES {
+            t.fail_at(&format!("10.0.0.{i}"), now);
+        }
+        assert!(t.check_at("9.9.9.9", now).is_err(), "twenty wrong tries from anywhere close it");
+        assert!(t.check_at("9.9.9.9", now + LOCK + std::time::Duration::from_secs(1)).is_ok(), "and it opens again");
+    }
+
+    #[test]
+    fn the_caller_is_the_address_the_proxy_reports() {
+        assert_eq!(client_ip(&headers(&[("cf-connecting-ip", "5.6.7.8"), ("x-forwarded-for", "1.1.1.1")])), "5.6.7.8");
+        assert_eq!(client_ip(&headers(&[("x-forwarded-for", "9.9.9.9, 10.0.0.1")])), "9.9.9.9");
+        assert_eq!(client_ip(&HeaderMap::new()), "local");
+    }
+
     #[test]
     fn keys_are_random_hex_and_compared_whole() {
         let (a, b) = (new_key(), new_key());

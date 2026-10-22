@@ -3,7 +3,7 @@
 O site fica no ar 24 h, sem o seu computador. Um container roda três coisas juntas:
 
 ```
- navegador ──https──▶ Cloudflare (domínio, HTTPS, Access) ──▶ Railway: container
+ navegador ──https──▶ Cloudflare (domínio e HTTPS) ──▶ Railway: container
                                                                  ├─ xau-web         (o servidor e as telas)
                                                                  ├─ Chromium        (roda a página de login da Microsoft)
                                                                  └─ Cloudflare WARP (modo proxy, 127.0.0.1:40000)
@@ -39,7 +39,7 @@ O container entra no seu Zero Trust como um "dispositivo" sem tela, com um token
 | Variável | Valor | Para quê |
 |---|---|---|
 | `XAU_PUBLIC_HOSTS` | `rewardsxb.site` | o nome pelo qual o servidor responde (outros nomes são recusados) |
-| `XAU_KEY` | uma sequência longa e aleatória (32+ caracteres) | a chave de acesso (cookie); quem a tem controla as contas |
+| `XAU_PASSWORD` | a senha que você vai digitar (10+ caracteres) | pedida na página inicial; quem a tem controla as contas |
 | `WARP_TEAM` | `hsplay` | a equipe do Zero Trust |
 | `WARP_CLIENT_ID` | o Client ID do passo 1 | inscrição do WARP |
 | `WARP_CLIENT_SECRET` | o Client Secret do passo 1 | inscrição do WARP |
@@ -49,22 +49,26 @@ O container entra no seu Zero Trust como um "dispositivo" sem tela, com um token
 4. **Settings → Networking → Custom Domain → `rewardsxb.site`.** O Railway mostra um destino
    (`xxxx.up.railway.app`) para o CNAME.
 
-## 3. Cloudflare: domínio e proteção
+## 3. Cloudflare: domínio
 
 1. **DNS** do `rewardsxb.site`: um registro **CNAME** `@` (a Cloudflare achata o CNAME na raiz)
    apontando para o destino do Railway, **Proxied (nuvem laranja)**.
 2. **SSL/TLS → Overview → Full (strict).**
-3. **Zero Trust → Access → Applications → Add → Self-hosted:** domínio `rewardsxb.site`, uma
-   política **Allow** só para o seu e-mail (login por código "One-time PIN"). Assim o site nem
-   chega ao servidor sem passar por esse login; a chave do `XAU_KEY` é a segunda camada.
 
-## 4. Primeiro acesso
+Não há login da Cloudflare na frente: o acesso é só a senha do site (abaixo).
 
-Abra `https://rewardsxb.site/?key=<o valor de XAU_KEY>` uma vez (depois do login do Access). O link
-grava o cookie e redireciona; a partir daí é só abrir `https://rewardsxb.site/`. Em **Ajustes** não
-há nada de rede, mas `https://rewardsxb.site/api/info` mostra o estado da saída:
-`"egress": {"ok": true, "warp": "on", "colo": "GRU", ...}`.
+## 4. Acesso
 
+Abra `https://rewardsxb.site/`, digite a senha e entre (o navegador guarda o acesso por um ano).
+
+* **Tentativas limitadas.** 5 senhas erradas do mesmo endereço bloqueiam esse endereço por 5 minutos;
+  20 erradas, de qualquer lugar, bloqueiam todas as tentativas por 10 minutos (mesmo a senha certa).
+  Assim ninguém consegue ficar chutando a senha.
+* **Se alguém bloquear você de propósito:** o servidor também aceita `https://rewardsxb.site/?key=<chave>`;
+  a chave aparece nos logs do Railway na primeira inicialização (ou fica em `/data/web-key.txt`).
+* `https://rewardsxb.site/api/info` (depois de entrar) mostra o estado da saída pela Cloudflare:
+  `egress: {ok: true, warp: on, colo: GRU, ...}`.
+* Escolha uma senha longa e só sua: ela é a única barreira entre a internet e as suas contas.
 ## 5. Se algo não funcionar
 
 * **Logs do Railway.** O entrypoint escreve `[entrypoint] ...`; se o proxy do WARP não subir em 90 s,
@@ -84,7 +88,8 @@ há nada de rede, mas `https://rewardsxb.site/api/info` mostra o estado da saíd
 |---|---|
 | `PORT` | porta de escuta, em todas as interfaces (o host define) |
 | `XAU_PUBLIC_HOSTS` | nomes aceitos, separados por vírgula; liga o modo servidor |
-| `XAU_KEY` | chave de acesso (32+ caracteres); sem ela, uma é criada em `/data/web-key.txt` e aparece nos logs |
+| `XAU_PASSWORD` | a senha pedida na página inicial (10+ caracteres) |
+| `XAU_KEY` | (opcional) a chave da sessão e do link de emergência; sem ela, uma é criada em `/data/web-key.txt` e aparece nos logs |
 | `XAU_DATA_DIR` | pasta de dados (o volume), `/data` na imagem |
 | `XAU_EGRESS_PROXY` | proxy de saída (`socks5h://127.0.0.1:40000`); o entrypoint define quando há `WARP_*` |
 | `XAU_ALLOW_DIRECT_EGRESS` | **só testes**: aceita falar com a Microsoft sem o WARP |

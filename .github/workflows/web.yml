@@ -47,6 +47,7 @@ jobs:
           docker run -d --name xau -p 8080:8080 \
             -e PORT=8080 \
             -e XAU_PUBLIC_HOSTS=localhost \
+            -e XAU_PASSWORD=senha-de-teste-do-ci \
             -e XAU_KEY=0123456789abcdef0123456789abcdef0123456789abcdef \
             -e XAU_WEB_BENCH=1 \
             xau-web:ci
@@ -63,9 +64,16 @@ jobs:
           # no cookie: refused
           code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/api/info)
           test "$code" = "401"
-          # the key link sets the cookie (public mode: one fixed name)
-          curl -s -o /dev/null -c jar -H 'Host: localhost:8080' \
-            "http://localhost:8080/?key=0123456789abcdef0123456789abcdef0123456789abcdef"
+          # the front page asks for the password
+          curl -fsS http://localhost:8080/ | grep -q "Digite a senha"
+          # a wrong password is refused and sets nothing; the right one sets the cookie
+          printf '{"password":"errada-errada"}' > wrong.json
+          printf '{"password":"senha-de-teste-do-ci"}' > right.json
+          code=$(curl -s -o /dev/null -w '%{http_code}' -c jar0 -H 'Origin: http://localhost:8080' -H 'x-xau: 1' -H 'content-type: application/json' --data-binary @wrong.json http://localhost:8080/api/unlock)
+          test "$code" = "401"
+          ! grep -q xau_key jar0 2> /dev/null
+          code=$(curl -s -o /dev/null -w '%{http_code}' -c jar -H 'Origin: http://localhost:8080' -H 'x-xau: 1' -H 'content-type: application/json' --data-binary @right.json http://localhost:8080/api/unlock)
+          test "$code" = "200"
           grep -q xau_key jar
           # a wrong host is refused
           code=$(curl -s -o /dev/null -w '%{http_code}' -b jar -H 'Host: evil.example' http://localhost:8080/api/info)

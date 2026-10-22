@@ -21,6 +21,9 @@ pub struct App {
     pub port: u16,
     pub access: auth::Access,
     pub egress: Arc<crate::egress::Egress>,
+    /// The password a person types to get the session cookie (None: only the key link opens it).
+    pub password: Option<Arc<String>>,
+    pub throttle: Arc<auth::Throttle>,
     pub host: Host,
     pub logins: Arc<Logins>,
     /// `select` then `store_purchase_form` act on "the active account":
@@ -31,6 +34,7 @@ pub struct App {
 pub fn router(app: App) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/api/unlock", post(unlock))
         .route("/", get(index))
         .route("/assets/*path", get(asset))
         .route("/api/info", get(info))
@@ -98,6 +102,45 @@ fn err(e: impl ToString) -> Response {
 
 // --------------------------------------------------------------- pages
 
+/// The session cookie: HttpOnly, never sent cross-site, and over https only when the page is https.
+fn session_cookie(app: &App, h: &HeaderMap) -> String {
+    let secure_flag = if app.access.scheme(h) == "https" { "; Secure" } else { "" };
+    format!("{}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age=31536000{secure_flag}", app.access.cookie_name(app.port), app.key)
+}
+
+/// The password page's request: the right password gets the session cookie. Wrong ones wait a
+/// moment and count against the address and the server (see `auth::Throttle`).
+async fn unlock(State(app): State<App>, h: HeaderMap, body: Bytes) -> Response {
+    if !app.access.host_ok(&h) {
+        return text(StatusCode::FORBIDDEN, "host não permitido");
+    }
+    if !app.access.post_ok(&h) {
+        return text(StatusCode::FORBIDDEN, "origem não permitida");
+    }
+    let Some(password) = app.password.clone() else {
+        return text(StatusCode::NOT_FOUND, "não encontrado");
+    };
+    let ip = auth::client_ip(&h);
+    if let Err(wait) = app.throttle.check(&ip) {
+        return secure((StatusCode::TOO_MANY_REQUESTS, Json(json!({ "err": "tentativas demais", "retry": wait.as_secs() }))).into_response());
+    }
+    let given = serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|v| v["password"].as_str().map(str::to_string))
+        .unwrap_or_default();
+    if auth::same(&given, &password) {
+        app.throttle.clear(&ip);
+        let mut r = ok(json!({}));
+        if let Ok(c) = HeaderValue::from_str(&session_cookie(&app, &h)) {
+            r.headers_mut().insert(header::SET_COOKIE, c);
+        }
+        return r;
+    }
+    app.throttle.fail(&ip);
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    secure((StatusCode::UNAUTHORIZED, Json(json!({ "err": "senha incorreta" }))).into_response())
+}
+
 /// For the host's health check: that the server is up, and nothing else (no names, no data).
 async fn healthz() -> Response {
     secure(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], "ok").into_response())
@@ -109,18 +152,18 @@ async fn index(State(app): State<App>, h: HeaderMap, Query(q): Query<HashMap<Str
     }
     // The printed link carries the key once; from then on a cookie does.
     if q.get("key").is_some_and(|k| auth::same(k, &app.key)) {
-        // Over https (a public server) the cookie is never sent over plain http.
-        let secure_flag = if app.access.scheme(&h) == "https" { "; Secure" } else { "" };
-        let cookie = format!(
-            "{}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age=31536000{secure_flag}",
-            app.access.cookie_name(app.port),
-            app.key
-        );
+        let cookie = session_cookie(&app, &h);
         return secure(
             (StatusCode::FOUND, [(header::LOCATION, "/".to_string()), (header::SET_COOKIE, cookie)]).into_response(),
         );
     }
     if !app.access.cookie_ok(&h, app.port, &app.key) {
+        // With a password set, the person is asked for it, here, on the front page.
+        if app.password.is_some() {
+            if let Some(a) = assets::get("unlock.html") {
+                return secure(([(header::CONTENT_TYPE, a.mime)], a.bytes.into_owned()).into_response());
+            }
+        }
         return text(
             StatusCode::UNAUTHORIZED,
             "Abra o link com a chave do xau-web (no terminal, ou nos logs do servidor).",
