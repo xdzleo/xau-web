@@ -122,7 +122,7 @@ export function startPageView(id) {
   const canvas = h('canvas', { class: 'pageimg', 'aria-label': 'Página de login da Microsoft', role: 'img' });
   const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
   // A real field, only to hold the keyboard (and bring up the phone's).
-  const kbd = h('input', { class: 'pagekbd', type: 'text', autocomplete: 'off', autocapitalize: 'off', spellcheck: 'false', 'aria-label': 'Teclado da página de login' });
+  const kbd = h('input', { class: 'pagekbd', type: 'text', autocomplete: 'off', autocorrect: 'off', autocapitalize: 'off', spellcheck: 'false', enterkeyhint: 'go', 'aria-label': 'Teclado da página de login' });
   const el = h('div', { class: 'pageview', tabindex: '-1' }, canvas, kbd, h('div', { class: 'pageload' }, 'Carregando a página da Microsoft…'));
 
   const dpr = () => Math.min(2, window.devicePixelRatio || 1);
@@ -162,10 +162,20 @@ export function startPageView(id) {
     }
   };
 
+  // The page answers every input with whether a field has the focus. Right after a tap, the
+  // answer to the touch's start (before the field took it) can still be on its way: a "no" that
+  // close to the tap waits for the later answers before the keyboard goes away.
+  let tappedAt = 0;
+  let letGo = 0;
   const keyboard = (on) => {
     editing = on;
+    clearTimeout(letGo);
     if (on) kbd.focus({ preventScroll: true });
-    else if (document.activeElement === kbd) kbd.blur();
+    else if (document.activeElement === kbd) {
+      letGo = setTimeout(() => {
+        if (!editing && document.activeElement === kbd) kbd.blur();
+      }, Math.max(0, tappedAt + 450 - Date.now()));
+    }
   };
 
   let shown = '';
@@ -281,6 +291,13 @@ export function startPageView(id) {
     else if (touching) {
       touching = false;
       send({ kind: 'touch', type: e.type === 'pointercancel' ? 'touchCancel' : 'touchEnd', ...at(e) });
+      // A phone opens its keyboard only for a field focused during the tap itself; the page says
+      // whether the tap landed in a field only afterwards. So the field takes focus now, and is
+      // let go again if the page says it was not a text field.
+      if (e.type === 'pointerup') {
+        tappedAt = Date.now();
+        kbd.focus({ preventScroll: true });
+      }
     }
   };
   canvas.addEventListener('pointerup', up);
@@ -291,16 +308,47 @@ export function startPageView(id) {
     send({ kind: 'mouse', type: 'mouseWheel', ...at(e), deltaX: e.deltaX, deltaY: e.deltaY });
   }, { passive: false });
 
-  // Text (typed, pasted, or from a phone's keyboard) arrives as input events;
-  // keys that are not text go as key events.
-  kbd.addEventListener('input', () => {
-    const t = kbd.value;
-    kbd.value = '';
-    if (t) send({ kind: 'text', text: t });
-  });
+  // Text (typed, pasted, or from a phone's keyboard) arrives as input events; keys that are
+  // not text go as key events.
+  //
+  // A phone keyboard edits the field as a whole: it composes a word in place, swaps it for a
+  // correction, and deletes with no key event at all. So the field is mirrored: whatever changed
+  // since the last look goes to the page as Backspaces plus the new text. A few padding
+  // characters sit in front, so a Backspace in a field that looks empty still deletes something
+  // (and reaches the page).
+  const PAD = ' '.repeat(8);
+  let mirrored = PAD;
+  let composing = false;
+  const resetField = () => {
+    kbd.value = PAD;
+    mirrored = PAD;
+    try { kbd.setSelectionRange(PAD.length, PAD.length); } catch {}
+  };
+  const backspace = () => {
+    send({ kind: 'key', type: 'rawKeyDown', key: 'Backspace', code: 'Backspace', vk: 8, modifiers: 0 });
+    send({ kind: 'key', type: 'keyUp', key: 'Backspace', code: 'Backspace', vk: 8, modifiers: 0 });
+  };
+  const sync = () => {
+    const now = kbd.value;
+    let same = 0;
+    while (same < now.length && same < mirrored.length && now[same] === mirrored[same]) same++;
+    for (let i = same; i < mirrored.length; i++) backspace();
+    const added = now.slice(same).replace(/ /g, ' ');
+    if (added) send({ kind: 'text', text: added });
+    mirrored = now;
+    // Back to the padding between words, never in the middle of one being composed.
+    if (!composing && (now.length < PAD.length || now.length > PAD.length + 40 || !now.startsWith(PAD))) resetField();
+  };
+  kbd.addEventListener('compositionstart', () => { composing = true; });
+  kbd.addEventListener('compositionend', () => { composing = false; sync(); });
+  kbd.addEventListener('input', sync);
+  kbd.addEventListener('focus', resetField);
+  resetField();
   const keyEv = (type) => (e) => {
     const vk = VK[e.key];
     if (vk == null || e.ctrlKey || e.metaKey) return;
+    // A phone keyboard's Backspace edits the field (mirrored above), whatever key event it sends.
+    if (e.key === 'Backspace' && !matchMedia('(pointer: fine)').matches) return;
     e.preventDefault();
     e.stopPropagation(); // Esc belongs to the Microsoft page here; "Cancelar" closes the screen
     const modifiers = (e.altKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.metaKey ? 4 : 0) | (e.shiftKey ? 8 : 0);
