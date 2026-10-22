@@ -407,3 +407,8 @@ svg { display: block; width: 100%; height: 100%; }
 .pageview .pagekbd { position: absolute; left: 0; bottom: 0; width: 1px; height: 1px; opacity: 0; border: 0; padding: 0; pointer-events: none; }
 .pageview .pageload { position: absolute; inset: 0; display: grid; place-items: center; color: var(--text2); font: 400 14px/1.4 Archivo, sans-serif; }
 .pageview.live .pageload { display: none; }
+/* The password page. */
+.unlock { width: 100%; max-width: 320px; margin-top: var(--lg); display: flex; flex-direction: column; gap: var(--md); }
+.unlock input { height: var(--touch); border-radius: var(--r-control); background: var(--surface-high); border: 1px solid var(--outline); padding: 0 var(--md); color: var(--text); font: 400 16px Archivo, sans-serif; outline: none; }
+.unlock input:focus { border-color: var(--green); }
+.unlock .msg { margin: 0; }

@@ -1,0 +1,102 @@
+# The web version: tests on Linux, then the container image, started and exercised.
+#
+# The smoke test is the part that matters for a cloud host: the image is run the way Railway runs it
+# (a PORT, a public host, a key), its health check answers, and the headless Chromium inside it
+# opens the local benchmark page and sends back a frame (a JPEG), through the same DevTools path
+# that runs Microsoft's sign-in page. Nothing here talks to Microsoft, and WARP is not started
+# (it needs the Zero Trust secrets): the server's refusal to call Microsoft without it is tested.
+name: web
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Tests (xau-web, xau-api)
+        run: cargo test -p xau-web -p xau-api
+        env:
+          RUSTFLAGS: "-C target-cpu=x86-64"
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: xau-web:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Start it as a cloud host would
+        run: |
+          docker run -d --name xau -p 8080:8080 \
+            -e PORT=8080 \
+            -e XAU_PUBLIC_HOSTS=localhost \
+            -e XAU_PASSWORD=senha-de-teste-do-ci \
+            -e XAU_KEY=0123456789abcdef0123456789abcdef0123456789abcdef \
+            -e XAU_WEB_BENCH=1 \
+            xau-web:ci
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:8080/healthz > /dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          curl -fsS http://localhost:8080/healthz
+          echo
+
+      - name: Health check, access key, and the WARP rule
+        run: |
+          set -e
+          # no cookie: refused
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/api/info)
+          test "$code" = "401"
+          # the front page asks for the password
+          curl -fsS http://localhost:8080/ | grep -q "Digite a senha"
+          # a wrong password is refused and sets nothing; the right one sets the cookie
+          printf '{"password":"errada-errada"}' > wrong.json
+          printf '{"password":"senha-de-teste-do-ci"}' > right.json
+          code=$(curl -s -o /dev/null -w '%{http_code}' -c jar0 -H 'Origin: http://localhost:8080' -H 'x-xau: 1' -H 'content-type: application/json' --data-binary @wrong.json http://localhost:8080/api/unlock)
+          test "$code" = "401"
+          ! grep -q xau_key jar0 2> /dev/null
+          code=$(curl -s -o /dev/null -w '%{http_code}' -c jar -H 'Origin: http://localhost:8080' -H 'x-xau: 1' -H 'content-type: application/json' --data-binary @right.json http://localhost:8080/api/unlock)
+          test "$code" = "200"
+          grep -q xau_key jar
+          # a wrong host is refused
+          code=$(curl -s -o /dev/null -w '%{http_code}' -b jar -H 'Host: evil.example' http://localhost:8080/api/info)
+          test "$code" = "403"
+          # nothing reaches Microsoft without Cloudflare WARP
+          out=$(curl -s -b jar -X POST -H 'Origin: http://localhost:8080' -H 'x-xau: 1' \
+                -H 'content-type: application/json' -d '{}' http://localhost:8080/api/call/store_browse)
+          echo "$out"
+          echo "$out" | grep -q "WARP"
+
+      - name: The headless Chromium in the image renders a frame
+        run: |
+          set -e
+          out=$(curl -s -m 90 -b jar -X POST -H 'Origin: http://localhost:8080' -H 'x-xau: 1' \
+                -H 'content-type: application/json' -d '{}' 'http://localhost:8080/api/bench/start?anim=0')
+          echo "$out"
+          echo "$out" | grep -q '"ok"'
+          sleep 3
+          curl -s -m 30 -b jar -o frame.jpg 'http://localhost:8080/api/login/bench/frame?w=411&h=742&d=175'
+          ls -l frame.jpg
+          # a JPEG starts with FF D8
+          head -c 2 frame.jpg | xxd -p | grep -q '^ffd8'
+
+      - name: Logs
+        if: always()
+        run: docker logs xau | sed -E 's/(key=)[0-9a-f]+/\1<hidden>/g' | tail -n 60

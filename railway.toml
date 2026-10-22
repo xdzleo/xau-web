@@ -1,0 +1,11 @@
+# Railway: build the Dockerfile, check /healthz, restart if it falls over.
+# The volume (mount path /data) and the variables are set in Railway; see docs/DEPLOY-RAILWAY.md.
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+healthcheckPath = "/healthz"
+healthcheckTimeout = 300
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10

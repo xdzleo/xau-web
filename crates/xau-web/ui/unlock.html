@@ -1,0 +1,26 @@
+﻿<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#0a0c0a">
+  <title>Xbox Rewards</title>
+  <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+  <div id="glow"></div>
+  <main class="welcome">
+    <div class="logo big"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20z"/></svg></div>
+    <h1>Xbox <span class="green">Rewards</span></h1>
+    <p class="t2" style="margin-top:24px">Digite a senha para entrar.</p>
+    <form id="f" class="unlock" autocomplete="on">
+      <input id="pw" name="password" type="password" autocomplete="current-password" placeholder="Senha" aria-label="Senha" autofocus required>
+      <button class="btn primary lg" type="submit">Entrar</button>
+      <p id="msg" class="caption danger" role="alert" hidden></p>
+    </form>
+  </main>
+  <script src="/assets/js/unlock.js"></script>
+</body>
+</html>
