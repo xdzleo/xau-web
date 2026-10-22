@@ -1,4 +1,23 @@
-# xau-mobile
+# xau-web
+
+The **web version of [xau-mobile](https://github.com/xdzleo/xau-mobile)**: everything the Android
+app does, in the browser. A local server runs the same Rust core as the app (`crates/xau-api`, which
+the Android app also calls) and serves the app's own screens; Microsoft's sign-in page runs in a
+hidden WebView2 and is streamed into the site (screencast over a WebSocket, ~15 ms touch-to-screen).
+
+```
+cargo build -p xau-web --release
+target/release/xau-web.exe          # opens the browser with the access key
+```
+
+Windows only for signing in (WebView2). See [`crates/xau-web/README.md`](crates/xau-web/README.md)
+for how it works, the security model and the benchmark.
+
+The Android app it comes from lives in the same workspace; its description follows.
+
+---
+
+## xau-mobile
 
 Android app for **Microsoft Rewards on Xbox**. A cut-down fork of
 [xau-rs](https://github.com/xdzleo/xau-rs) that does four things:

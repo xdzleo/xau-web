@@ -30,3 +30,6 @@ __pycache__/
 # Screenshot captures from the review loop
 shots/
 android/app/src/test/snapshots/
+
+# xau-web release binaries (published as releases, not in git)
+dist/

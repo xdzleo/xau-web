@@ -1,0 +1,17 @@
+[package]
+name = "xau-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The app's commands (sessions, freeze, farm, store, offers), shared by the Android and web hosts"
+
+[dependencies]
+xau-mobile = { path = "../xau-mobile" }
+xau-core = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true
