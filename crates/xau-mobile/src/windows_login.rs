@@ -23,7 +23,8 @@
 //! Because the STS token mints fresh xauths on demand, these accounts
 //! also survive the 16-hour xauth lifetime without signing in again.
 
-use std::sync::Mutex;
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use msa_device::{LoginStep, PageMessage, StsToken, XBOX_APP_CLIENT_ID};
@@ -75,7 +76,8 @@ pub struct SignedIn {
     pub device: Device,
 }
 
-/// The sign-in in progress. One at a time: the WebView is modal.
+/// A sign-in in progress. The app has one at a time (its WebView is modal, key ""); the web
+/// server runs several at once, one per person, each under its own key.
 struct Pending {
     /// Registered for this sign-in alone: every login is a new device.
     device: Device,
@@ -86,9 +88,9 @@ struct Pending {
     busy: bool,
 }
 
-static PENDING: Mutex<Option<Pending>> = Mutex::new(None);
+static PENDING: LazyLock<Mutex<HashMap<String, Pending>>> = LazyLock::new(Mutex::default);
 
-fn pending() -> std::sync::MutexGuard<'static, Option<Pending>> {
+fn pending() -> std::sync::MutexGuard<'static, HashMap<String, Pending>> {
     PENDING.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
@@ -113,10 +115,18 @@ fn http() -> Result<reqwest::Client> {
 /// # Errors
 /// Fails when the device cannot be registered or signed in.
 pub async fn start() -> Result<LoginPage> {
+    start_for("").await
+}
+
+/// [`start`], for the sign-in kept under `key` (several can run at once, each with its own).
+///
+/// # Errors
+/// As [`start`].
+pub async fn start_for(key: &str) -> Result<LoginPage> {
     let http = http()?;
     let device = msa_device::provision_device(&http).await.map_err(err)?;
     let device_sts = msa_device::authenticate_device(&http, &device).await.map_err(err)?;
-    *pending() = Some(Pending { device, device_sts, finish: false, busy: false });
+    pending().insert(key.to_string(), Pending { device, device_sts, finish: false, busy: false });
 
     let correlation = msa_device::new_correlation_id();
     Ok(LoginPage {
@@ -139,6 +149,14 @@ pub async fn start() -> Result<LoginPage> {
 /// Fails when no sign-in is in progress, or when Microsoft or Xbox Live
 /// refuse the exchange. The sign-in is over after an error.
 pub async fn on_message(body: &str) -> Result<PageReply> {
+    on_message_for("", body).await
+}
+
+/// [`on_message`], for the sign-in kept under `key`.
+///
+/// # Errors
+/// As [`on_message`].
+pub async fn on_message_for(key: &str, body: &str) -> Result<PageReply> {
     let da = match msa_device::parse_page_message(body) {
         PageMessage::ContextRequest(ctx) => {
             return Ok(PageReply::Eval(msa_device::host_context_reply_script(&ctx)))
@@ -150,7 +168,7 @@ pub async fn on_message(body: &str) -> Result<PageReply> {
     let (device, device_sts, finish) = {
         let mut guard = pending();
         let p = guard
-            .as_mut()
+            .get_mut(key)
             .ok_or_else(|| Error::other("nenhum login em andamento"))?;
         if p.busy {
             return Ok(PageReply::Ignore);
@@ -163,20 +181,20 @@ pub async fn on_message(body: &str) -> Result<PageReply> {
     let step = match msa_device::exchange_login(&http, &device_sts, da, finish).await {
         Ok(s) => s,
         Err(e) => {
-            *pending() = None;
+            pending().remove(key);
             return Err(err(e));
         }
     };
     match step {
         LoginStep::Finalize(url) => {
-            if let Some(p) = pending().as_mut() {
+            if let Some(p) = pending().get_mut(key) {
                 p.finish = true;
                 p.busy = false;
             }
             Ok(PageReply::Open(url))
         }
         LoginStep::Done(mut user) => {
-            *pending() = None;
+            pending().remove(key);
             let xauth = issue_xauth(&device, &mut user).await?;
             let session = crate::session_from_token(xauth).await?;
             Ok(PageReply::Done(Box::new(SignedIn { session, user, device })))
@@ -255,6 +273,11 @@ pub async fn restore(device: &Device, mut user: UserSession) -> Result<(Session,
 
 /// Abandon the sign-in in progress (the user closed the page).
 pub fn cancel() {
-    *pending() = None;
+    cancel_for("");
+}
+
+/// [`cancel`], for the sign-in kept under `key`.
+pub fn cancel_for(key: &str) {
+    pending().remove(key);
 }
 

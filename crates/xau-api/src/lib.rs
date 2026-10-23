@@ -554,7 +554,9 @@ async fn dispatch_inner(method: &str, args: &Value) -> Result<Value> {
 
         // ---- Windows sign-in (the one the presence farm needs) ----
         "windows_login_start" => {
-            let page = xau_mobile::windows_login::start().await?;
+            // `login`: the key of this sign-in, when several run at once (the web server); the
+            // app leaves it out and has one.
+            let page = xau_mobile::windows_login::start_for(&arg("login")).await?;
             Ok(serde_json::to_value(page)?)
         }
 
@@ -562,7 +564,7 @@ async fn dispatch_inner(method: &str, args: &Value) -> Result<Value> {
         // tells the WebView what to do next.
         "windows_login_message" => {
             use xau_mobile::windows_login::PageReply;
-            Ok(match xau_mobile::windows_login::on_message(&arg("body")).await? {
+            Ok(match xau_mobile::windows_login::on_message_for(&arg("login"), &arg("body")).await? {
                 PageReply::Ignore => json!({ "action": "ignore" }),
                 PageReply::Eval(script) => json!({ "action": "eval", "script": script }),
                 PageReply::Open(url) => json!({ "action": "open", "url": url }),
@@ -575,7 +577,7 @@ async fn dispatch_inner(method: &str, args: &Value) -> Result<Value> {
         }
 
         "windows_login_cancel" => {
-            xau_mobile::windows_login::cancel();
+            xau_mobile::windows_login::cancel_for(&arg("login"));
             Ok(json!({}))
         }
 
