@@ -1,0 +1,12 @@
+{
+  "name": "xau-web-scramjet",
+  "version": "1.0.0",
+  "private": true,
+  "description": "The runtime of the in-browser sign-in (crates/xau-web/ui/js/sjlogin.js), pinned. layout.mjs puts its files where the server looks for them.",
+  "license": "AGPL-3.0-only",
+  "dependencies": {
+    "@mercuryworkshop/scramjet": "2.0.67-alpha.2",
+    "@mercuryworkshop/scramjet-controller": "0.0.14",
+    "@mercuryworkshop/libcurl-transport": "2.0.6"
+  }
+}

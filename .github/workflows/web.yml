@@ -86,6 +86,28 @@ jobs:
           echo "$out"
           echo "$out" | grep -q "WARP"
 
+      - name: The in-browser sign-in's files, and the Wisp relay's rules
+        run: |
+          set -e
+          base=http://localhost:8080
+          ver=$(curl -fsS -b jar $base/api/info | python3 -c 'import json,sys; print(json.load(sys.stdin)["scramjet"])')
+          echo "runtime version: $ver"
+          test -n "$ver" && test "$ver" != None
+          # the service worker names exactly that version
+          curl -fsS $base/sw.js | grep -q "/sj/$ver/controller/controller.sw.js"
+          for f in controller/controller.api.js controller/controller.inject.js controller/controller.sw.js scram/scramjet.js scram/scramjet.wasm clients/libcurl-client.js; do
+            curl -fsS -o /dev/null "$base/sj/$ver/$f"
+          done
+          # the patched Scramjet, and no other path under it
+          curl -fsS "$base/sj/$ver/scram/scramjet.js" | grep -q "patched by xau-web"
+          code=$(curl -s -o /dev/null -w '%{http_code}' "$base/sj/$ver/SOURCES.txt"); test "$code" = "404"
+          code=$(curl -s -o /dev/null -w '%{http_code}' "$base/sj/0000/scram/scramjet.js"); test "$code" = "404"
+          # the relay: refuses everything that is not Microsoft's, and Microsoft's too while WARP is not confirmed
+          mkdir -p /tmp/wc && (cd /tmp/wc && npm install --no-audit --no-fund ws > /dev/null)
+          cookie=$(awk -F'\t' '!/^# / && NF>=7 {print $6"="$7}' jar | paste -sd';')
+          cp .github/scripts/wisp-check.mjs /tmp/wc/
+          (cd /tmp/wc && node wisp-check.mjs ws://localhost:8080/wisp/ $base "$cookie")
+
       - name: The headless Chromium in the image renders a frame
         run: |
           set -e

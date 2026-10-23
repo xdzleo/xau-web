@@ -5,6 +5,7 @@ import { S, byXuid, live, totalBalance, totalWaiting } from '../state.js';
 import { toast, skeleton, gameArt, avatar, switchEl } from '../ui.js';
 import * as act from '../actions.js';
 import { startLogin } from './login.js';
+import { preload as sjPreload } from '../sjlogin.js';
 
 let lastTotal = null; // so the total counts from what it showed, not from zero
 const lastBalance = new Map();
@@ -190,7 +191,7 @@ function accountsHead() {
     { class: 'sectionhead' },
     h('div', { class: 'section' }, 'Contas'),
     h('span', { class: 'countbadge' }, S.accounts.length),
-    h('button', { class: 'addbtn', onClick: () => startLogin() }, '+ Adicionar'),
+    h('button', { class: 'addbtn', onClick: () => startLogin(), onPointerenter: () => sjPreload(), onTouchstart: () => sjPreload() }, '+ Adicionar'),
   );
 }
 
@@ -415,6 +416,8 @@ function welcome(enter) {
   const rise = (el) => wrapRise(enter, beat++, el);
   const mark = h('span', { class: 'ms-mark' });
   mark.innerHTML = MS_MARK;
+  // While the person reads this screen, the sign-in page loads out of sight, so "Entrar" shows one that is already there.
+  sjPreload();
   return h(
     'div',
     { class: 'welcome' },

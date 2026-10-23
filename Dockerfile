@@ -4,9 +4,10 @@
 #   docker run -p 8080:8080 -v xau-data:/data \
 #     -e PORT=8080 -e XAU_PUBLIC_HOSTS=rewards.example.com -e XAU_PASSWORD=<one,or,several> xau-web
 #
-# One container holds the server, the headless Chromium that runs Microsoft's sign-in page, and
-# a Cloudflare WARP proxy, through which everything meant for Microsoft leaves (see
-# docs/DEPLOY-RAILWAY.md). If WARP is not up, the server refuses to talk to Microsoft.
+# One container holds the server, the headless Chromium that runs Microsoft's sign-in page for the
+# browsers that cannot run it themselves, Scramjet's files for the ones that can, and a Cloudflare
+# WARP proxy, through which everything meant for Microsoft leaves (see docs/DEPLOY-RAILWAY.md).
+# If WARP is not up, the server refuses to talk to Microsoft.
 
 # ---- build -------------------------------------------------------------------------------
 FROM rust:1-bookworm AS build
@@ -18,6 +19,15 @@ COPY . .
 RUN cargo build --release -p xau-web \
  && strip target/release/xau-web \
  && cp target/release/xau-web /xau-web
+
+# ---- the in-browser sign-in's runtime ----------------------------------------------------
+# Scramjet and its libcurl transport (AGPL-3.0), installed at pinned versions from the lock file and
+# put in the layout the server serves, with the one fix to Scramjet that docker/scramjet/layout.mjs
+# applies (the build fails if that fix no longer fits).
+FROM node:22-bookworm-slim AS scramjet
+WORKDIR /sj
+COPY docker/scramjet/package.json docker/scramjet/package-lock.json docker/scramjet/layout.mjs ./
+RUN npm ci --ignore-scripts --no-audit --no-fund && node layout.mjs /out
 
 # ---- run ---------------------------------------------------------------------------------
 FROM debian:bookworm-slim
@@ -40,12 +50,14 @@ RUN curl -fsSL -o /tmp/usque.zip \
  && rm /tmp/usque.zip
 
 COPY --from=build /xau-web /usr/local/bin/xau-web
+COPY --from=scramjet /out /opt/scramjet
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 # A container runs as root, where Chromium's own sandbox cannot start.
 ENV XAU_CHROMIUM=/usr/bin/chromium \
     XAU_CHROMIUM_NO_SANDBOX=1 \
+    XAU_SCRAMJET_DIR=/opt/scramjet \
     XAU_DATA_DIR=/data
 # The data folder is a volume, but not declared here: Railway refuses VOLUME in a Dockerfile. Its volume
 # (mount path /data, see docs/DEPLOY-RAILWAY.md) is made in the Railway panel; elsewhere use -v xau-data:/data.

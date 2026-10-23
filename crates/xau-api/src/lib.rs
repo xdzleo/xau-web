@@ -560,6 +560,10 @@ async fn dispatch_inner(method: &str, args: &Value) -> Result<Value> {
             Ok(serde_json::to_value(page)?)
         }
 
+        // The sign-in page's address, headers and scripts, with nothing registered: for a host
+        // that loads the page ahead of time (the web site, in the person's own browser).
+        "windows_login_page" => Ok(serde_json::to_value(xau_mobile::windows_login::page())?),
+
         // Every message the login page posts to the bridge. The reply
         // tells the WebView what to do next.
         "windows_login_message" => {

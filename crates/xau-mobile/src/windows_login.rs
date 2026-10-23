@@ -127,9 +127,15 @@ pub async fn start_for(key: &str) -> Result<LoginPage> {
     let device = msa_device::provision_device(&http).await.map_err(err)?;
     let device_sts = msa_device::authenticate_device(&http, &device).await.map_err(err)?;
     pending().insert(key.to_string(), Pending { device, device_sts, finish: false, busy: false });
+    Ok(page())
+}
 
+/// The sign-in page and what it needs to be loaded like Windows does: nothing registered, nothing
+/// kept, so a host may load it ahead of time (while the person is still deciding) at no cost.
+/// Every call has its own correlation id.
+pub fn page() -> LoginPage {
     let correlation = msa_device::new_correlation_id();
-    Ok(LoginPage {
+    LoginPage {
         url: msa_device::inline_login_url(XBOX_APP_CLIENT_ID),
         headers: msa_device::inline_login_headers(&correlation)
             .into_iter()
@@ -140,7 +146,7 @@ pub async fn start_for(key: &str) -> Result<LoginPage> {
         finish_script: msa_device::inline_login_finish_script(BRIDGE),
         finish_url_prefix: FINISH_URL_PREFIX.to_string(),
         bridge: BRIDGE.to_string(),
-    })
+    }
 }
 
 /// Handle one message the page posted to the bridge.

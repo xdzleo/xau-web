@@ -79,6 +79,11 @@ impl Egress {
         }
     }
 
+    /// The proxy everything goes out through (`socks5h://host:port`), if there is one.
+    pub fn proxy(&self) -> Option<&str> {
+        self.proxy.as_deref()
+    }
+
     /// Whether a call to Microsoft may go out now.
     pub fn require(&self) -> Result<(), String> {
         if !self.required {

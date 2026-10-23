@@ -483,6 +483,14 @@ body:has(.welcome) .nav, body:has(.welcome) #glow { display: none; }
 .loginwait { padding: var(--lg); display: flex; flex-direction: column; gap: var(--md); }
 .loginwork { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; padding: var(--xl); gap: var(--sm); }
 .logging #app, .logging #glow { visibility: hidden; }
+
+/* The sign-in page that runs in this browser (sjlogin.js). Out of sight it is laid out at its full
+   size, so it loads as it will look; it is shown by taking `stash` off, never by moving the frame. */
+.loginscreen.stash { visibility: hidden; pointer-events: none; }
+.sjstage { position: relative; }
+.sjframe { flex: 1; width: 100%; min-height: 0; border: 0; background: #fff; color-scheme: light; }
+.sjwait { position: absolute; inset: 0; background: var(--ink); display: flex; flex-direction: column; gap: var(--md); padding: var(--xxl) var(--lg); }
+.sjwait.off { display: none; }
 /* The page fills what is left, like the WebView; what it does not cover is the app's own dark. */
 .pageview { position: relative; flex: 1; min-height: 0; background: var(--ink); overflow: hidden; touch-action: none; user-select: none; -webkit-user-select: none; }
 .pageview .pageimg { display: block; width: 100%; height: 100%; object-fit: fill; user-select: none; -webkit-user-drag: none; opacity: 0; transition: opacity .2s; }

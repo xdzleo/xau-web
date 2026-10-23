@@ -27,6 +27,10 @@ pub struct App {
     pub throttle: Arc<auth::Throttle>,
     pub host: Host,
     pub logins: Arc<Logins>,
+    /// Where the browser's sign-in page may reach (see `wisp`).
+    pub wisp: Arc<crate::wisp::Policy>,
+    /// The files of the sign-in that runs in the person's browser; none: it is off.
+    pub sj: Option<Arc<crate::scramjet::Files>>,
     /// `select` then `store_purchase_form` act on "the active account":
     /// two checkouts at once must not swap it between the calls.
     pub checkout: Arc<tokio::sync::Mutex<()>>,
@@ -41,6 +45,14 @@ pub fn router(app: App) -> Router {
         .route("/api/info", get(info))
         .route("/api/call/:method", post(call))
         .route("/api/login/start", post(login_start))
+        .route("/api/login/direct/page", get(login_direct_page))
+        .route("/api/login/direct/start", post(login_direct_start))
+        .route("/api/login/direct/:id/message", post(login_direct_message))
+        .route("/api/login/direct/:id/cancel", post(login_direct_cancel))
+        .route("/wisp/", get(wisp_ws))
+        .route("/wisp", get(wisp_ws))
+        .route("/sw.js", get(sj_service_worker))
+        .route("/sj/:version/*path", get(sj_file))
         .route("/api/login/:id", get(login_status))
         .route("/api/login/:id/cancel", post(login_cancel))
         .route("/api/login/:id/frame", get(login_frame))
@@ -60,8 +72,10 @@ fn secure(mut r: Response) -> Response {
     h.insert(
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(
-            "default-src 'self'; img-src 'self' https: data: blob:; style-src 'self' 'unsafe-inline'; \
-             font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+            // 'wasm-unsafe-eval': the browser's sign-in page does its TLS in WebAssembly; blob: workers
+            // for the same. The sign-in page itself is a document of this origin, made by the service worker.
+            "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; img-src 'self' https: data: blob:; \
+             style-src 'self' 'unsafe-inline'; font-src 'self'; connect-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
         ),
     );
     h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
@@ -195,6 +209,8 @@ async fn info(State(app): State<App>, h: HeaderMap) -> Response {
         "os": std::env::consts::OS,
         "nativeWindows": app.host.native(),
         "signIn": true,
+        // The version of the in-browser sign-in's files (the URL they are under), or null: off.
+        "scramjet": app.sj.as_ref().map(|sj| sj.version.clone()),
         "lan": app.access.lan,
         "public": app.access.public(),
         "egress": app.egress.snapshot(),
@@ -258,6 +274,110 @@ async fn login_start(State(app): State<App>, h: HeaderMap) -> Response {
         Ok(id) => ok(json!({ "id": id })),
         Err(e) => err(e),
     }
+}
+
+// ------------------------------------------- sign-in in the person's browser
+
+/// What the sign-in page needs to be loaded like Windows does. Nothing is registered with
+/// Microsoft by this, so the site may call it ahead of time.
+async fn login_direct_page(State(app): State<App>, h: HeaderMap) -> Response {
+    if let Err(r) = guard(&app, &h, false) {
+        return r;
+    }
+    if app.sj.is_none() {
+        return err("o login no navegador está desligado neste servidor");
+    }
+    match xau_api::dispatch("windows_login_page", &Value::Null).await {
+        Ok(v) => ok(v),
+        Err(e) => err(e),
+    }
+}
+
+/// The person is signing in: register the Windows device with Microsoft and keep the core's side
+/// of the sign-in under an id.
+async fn login_direct_start(State(app): State<App>, h: HeaderMap) -> Response {
+    if let Err(r) = guard(&app, &h, true) {
+        return r;
+    }
+    if app.sj.is_none() {
+        return err("o login no navegador está desligado neste servidor");
+    }
+    if let Err(e) = app.egress.require() {
+        return err(e);
+    }
+    match app.logins.direct_start(&app.host).await {
+        Ok(id) => ok(json!({ "id": id })),
+        Err(e) => err(e),
+    }
+}
+
+/// A message the sign-in page posted to its bridge; the core answers what to do with it.
+async fn login_direct_message(State(app): State<App>, h: HeaderMap, Path(id): Path<String>, body: Bytes) -> Response {
+    if let Err(r) = guard(&app, &h, true) {
+        return r;
+    }
+    if let Err(e) = app.egress.require() {
+        return err(e);
+    }
+    let msg = serde_json::from_slice::<Value>(&body).ok().and_then(|v| v["body"].as_str().map(str::to_string)).unwrap_or_default();
+    match app.logins.direct_message(&id, &msg).await {
+        Ok(v) => ok(v),
+        Err(e) => err(e),
+    }
+}
+
+async fn login_direct_cancel(State(app): State<App>, h: HeaderMap, Path(id): Path<String>) -> Response {
+    if let Err(r) = guard(&app, &h, true) {
+        return r;
+    }
+    app.logins.direct_cancel(&id).await;
+    ok(json!({}))
+}
+
+/// The Wisp connection that carries the browser's sign-in page to Microsoft (see `wisp`).
+async fn wisp_ws(State(app): State<App>, h: HeaderMap, ws: axum::extract::ws::WebSocketUpgrade) -> Response {
+    if let Err(r) = guard(&app, &h, false) {
+        return r;
+    }
+    if !app.access.ws_origin_ok(&h) {
+        return text(StatusCode::FORBIDDEN, "origem não permitida");
+    }
+    if app.sj.is_none() {
+        return text(StatusCode::NOT_FOUND, "não encontrado");
+    }
+    let (egress, policy) = (app.egress.clone(), app.wisp.clone());
+    ws.max_message_size(1 << 20).on_upgrade(move |socket| crate::wisp::serve(socket, egress, policy))
+}
+
+/// The service worker that carries the sign-in page's requests. Served at the root so its scope
+/// is the whole site; it only answers the sign-in page's own prefix.
+async fn sj_service_worker(State(app): State<App>, h: HeaderMap) -> Response {
+    if !app.access.host_ok(&h) {
+        return text(StatusCode::FORBIDDEN, "host não permitido");
+    }
+    let Some(sj) = &app.sj else { return text(StatusCode::NOT_FOUND, "não encontrado") };
+    let mut r = (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8"), (header::CACHE_CONTROL, "no-cache")],
+        sj.service_worker(),
+    )
+        .into_response();
+    r.headers_mut().insert("service-worker-allowed", HeaderValue::from_static("/"));
+    r.headers_mut().insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    r
+}
+
+/// The runtime's files: public code (AGPL), the same for everyone, kept by the browser for good
+/// under a URL that carries their version.
+async fn sj_file(State(app): State<App>, h: HeaderMap, Path((version, path)): Path<(String, String)>) -> Response {
+    if !app.access.host_ok(&h) {
+        return text(StatusCode::FORBIDDEN, "host não permitido");
+    }
+    let Some(file) = app.sj.as_ref().and_then(|sj| (sj.version == version).then(|| sj.get(&path)).flatten()) else {
+        return text(StatusCode::NOT_FOUND, "não encontrado");
+    };
+    let mut r = ([(header::CONTENT_TYPE, file.mime), (header::CACHE_CONTROL, "public, max-age=31536000, immutable")], file.bytes.clone()).into_response();
+    r.headers_mut().insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    r
 }
 
 async fn login_status(State(app): State<App>, h: HeaderMap, Path(id): Path<String>) -> Response {
@@ -615,7 +735,7 @@ mod tests {
 
     #[test]
     fn the_sign_in_plumbing_and_the_checkout_token_are_not_exposed() {
-        for m in ["windows_login_start", "windows_login_message", "windows_login_cancel", "login_url", "on_navigate", "finish_login", "store_purchase_form"] {
+        for m in ["windows_login_start", "windows_login_page", "windows_login_message", "windows_login_cancel", "login_url", "on_navigate", "finish_login", "store_purchase_form"] {
             assert!(!ALLOWED.contains(&m), "{m} must stay server-side");
         }
         assert!(ALLOWED.contains(&"restore") && ALLOWED.contains(&"farm_start"));

@@ -11,9 +11,11 @@ mod auth;
 mod cdphost;
 mod egress;
 mod profiles;
+mod scramjet;
 mod server;
 mod signin;
 mod webhost;
+mod wisp;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -175,6 +177,8 @@ fn main() {
         password: password.clone().map(Arc::new),
         throttle: Arc::default(),
         logins: Arc::default(),
+        wisp: wisp::Policy::from_env(),
+        sj: scramjet::Files::load(),
         checkout: Arc::default(),
     };
     let router = server::router(app);
