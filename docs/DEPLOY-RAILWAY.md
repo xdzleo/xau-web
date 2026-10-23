@@ -18,6 +18,37 @@ Se o WARP ficar mais de 45 s sem responder, as chamadas passam a ser **recusadas
 do Railway. O Chromium usa
 `--proxy-server` e não resolve nomes sozinho; sem proxy ele mostra "No internet" em vez de sair direto.
 
+## O login: no navegador de quem entra, ou no servidor
+
+Há duas maneiras de abrir a página de login da Microsoft, e o site escolhe sozinho:
+
+* **No navegador da pessoa** (padrão, quando o navegador deixa): a página roda como uma página de
+  verdade do navegador de quem está entrando. O teclado, o gerenciador de senhas, a rolagem e os
+  toques são os do próprio navegador, sem atraso de rede, e o servidor não gasta memória por login
+  (~3 MB em vez de ~500 MB de um Chromium). Quem faz isso possível é o
+  [Scramjet](https://github.com/MercuryWorkshop/scramjet) (um service worker que reescreve a
+  página) com o transporte libcurl (o TLS roda em WebAssembly, no navegador). O que sai do
+  navegador vai por **um WebSocket** (`/wisp/`) até o servidor, que só repassa bytes, **só para
+  os domínios da Microsoft** (e dos captchas que ela usa), **só nas portas 80 e 443**, **só TCP**,
+  e **só pela Cloudflare** (cada conexão é um SOCKS5 para o proxy do WARP; se a saída não estiver
+  confirmada, nada sai). O núcleo continua no servidor: é ele que registra o dispositivo Windows, lê
+  o token do login e guarda a conta. A página é carregada **antes**, escondida, enquanto a pessoa
+  ainda está na tela de boas-vindas, então o "Entrar" mostra uma página que já está pronta.
+* **No servidor** (reserva): o Chromium do container abre a página e o site desenha a imagem dela. É
+  usado quando o navegador não suporta o modo acima (sem service worker, contexto não seguro), ou
+  quando a página não abre a tempo (25 s). Dá para forçar com `?login=stream` na URL.
+
+Os arquivos do Scramjet entram na imagem na hora da montagem (`docker/scramjet`: versões travadas pelo
+`package-lock.json`) e ficam em `/opt/scramjet` (`XAU_SCRAMJET_DIR`). Sem essa pasta o modo no
+navegador fica desligado e todos usam o do servidor. O Scramjet é AGPL-3.0; **o código do site é
+publicado no GitHub**, junto com a única correção que aplicamos a ele (`docker/scramjet/layout.mjs`: o
+`history.replaceState` sem URL levava a página para `/undefined`; corrigido por eles depois dessa
+versão). Se uma versão nova do Scramjet mudar esse trecho, a montagem da imagem **falha** em vez de
+publicar uma página que se comporta mal.
+
+Domínios extras que o relé deve aceitar (separados por vírgula): `XAU_WISP_ALLOW`. Os recusados
+aparecem no log como `wisp: recusado ...`.
+
 ## 1. O WARP
 
 Não precisa configurar nada. O container usa o **usque** (open source, o mesmo protocolo MASQUE do
@@ -92,6 +123,8 @@ Abra `https://rewardsxb.site/`, digite a senha e entre (o navegador guarda o ace
 | `XAU_WARP` | `off` desliga o WARP (as chamadas à Microsoft são recusadas) |
 | `XAU_WARP_TRANSPORT` | `http2` (padrão, TCP) ou `quic` (HTTP/3, UDP) |
 | `XAU_ALLOW_DIRECT_EGRESS` | **só testes**: aceita falar com a Microsoft sem o WARP |
+| `XAU_SCRAMJET_DIR` | pasta com os arquivos do login no navegador (na imagem: `/opt/scramjet`); sem ela, esse modo fica desligado |
+| `XAU_WISP_ALLOW` | domínios a mais que o relé do login no navegador aceita, separados por vírgula |
 | `XAU_CHROMIUM` | caminho do navegador (na imagem: `/usr/bin/chromium`) |
 | `XAU_CHROMIUM_NO_SANDBOX` | roda o Chromium sem o sandbox (necessário como root, na imagem) |
 | `XAU_WEB_BENCH` | **só testes**: liga a página de benchmark local |

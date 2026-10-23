@@ -7,3 +7,4 @@ docs
 .github
 .claude
 **/*.apk
+docker/scramjet/node_modules

@@ -26,7 +26,37 @@ xau-web.exe --no-open       # só imprime o link
   demais telas são páginas com seta de voltar. Segurar (ou botão direito) num card pede para
   remover a conta.
 
-### A página de login dentro do site
+### A página de login no navegador de quem entra (o modo principal)
+
+Quando o navegador deixa (HTTPS ou `localhost`, service worker, WebAssembly), a página da Microsoft
+roda **como uma página do próprio navegador**, dentro de um `<iframe>` do site, pelo
+[Scramjet](https://github.com/MercuryWorkshop/scramjet) (um service worker que reescreve a página e
+as requisições dela). O teclado, o gerenciador de senhas, a rolagem e os toques são do navegador, sem
+nenhuma viagem de rede por letra digitada. Código: `ui/js/sjlogin.js` (o motor) e `src/wisp.rs`
+(o relé).
+
+- **Os bytes**: o TLS é feito no navegador (libcurl em WebAssembly). Eles vão por um WebSocket em
+  `/wisp/` (protocolo [Wisp](https://github.com/MercuryWorkshop/wisp-protocol), v1) até o servidor,
+  que abre uma conexão SOCKS5 para o proxy do WARP por stream. O relé só aceita **domínios da
+  Microsoft** (e os captchas que ela usa), **portas 80 e 443**, **TCP**, e **só com a saída pela
+  Cloudflare confirmada**; nenhum endereço IP, nenhum nome parecido (`login.live.com.evil.com`).
+  O CI confere cada uma dessas recusas (`.github/scripts/wisp-check.mjs`).
+- **O núcleo continua no servidor**: registrar o dispositivo Windows, ler o token e guardar a conta.
+  A página fala com ele pela ponte `XauLogin` (as mesmas mensagens do app); a pergunta de contexto
+  do host (`CloudExperienceHost.getContext`) é respondida no próprio navegador, sem viagem de rede.
+  Os cabeçalhos `cxh-*` e o user agent do host Windows vão só nas requisições para a Microsoft.
+- **Pré-carga**: na tela de boas-vindas a página já é carregada, escondida, no tamanho final; o
+  "Entrar" só a mostra. Nada é registrado na Microsoft até a pessoa apertar (o dispositivo é
+  registrado então, enquanto ela digita). Uma página pré-carregada há mais de 4 min é recarregada.
+- **Isolamento**: antes e depois de cada login, os cookies da Microsoft guardados no navegador são
+  apagados; um login nunca vê o anterior.
+- **Reserva**: sem service worker, sem a pasta do runtime no servidor, ou se a página não abrir em
+  25 s, o site usa o modo abaixo. `?login=stream` força o modo do servidor.
+- **Correção no Scramjet**: a versão publicada leva a página para `/undefined` quando ela chama
+  `history.replaceState(estado, "")` sem URL (a página da Microsoft faz isso); `docker/scramjet/layout.mjs`
+  corrige (como o código deles depois dessa versão) e a montagem falha se o trecho mudar.
+
+### A página de login no servidor (a reserva)
 
 O WebView2 escondido roda a página no tamanho exato da tela do site. O motor empurra um quadro JPEG
 a cada repintura (`Page.startScreencast`, confirmado na hora), e um WebSocket leva esses quadros ao

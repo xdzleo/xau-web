@@ -10,8 +10,27 @@ import { api } from '../api.js';
 import { S } from '../state.js';
 import { toast, skeleton, stateBlock } from '../ui.js';
 import { refresh } from '../actions.js';
+import * as sj from '../sjlogin.js';
 
+/**
+ * Sign in. The page runs in this browser when it can (sjlogin.js: instant typing, the browser's own
+ * keyboard and password manager); when it cannot, or it does not open in time, in a browser on the
+ * server drawn here (`startStreamLogin`, below).
+ */
 export async function startLogin() {
+  if (sj.wanted()) {
+    try {
+      while ((await sj.startDirect()) === 'retry');
+      return;
+    } catch (e) {
+      if (!(e instanceof sj.Fallback)) throw e;
+      console.warn('login no navegador:', e.message);
+    }
+  }
+  return startStreamLogin();
+}
+
+async function startStreamLogin() {
   let id = null;
   let open = true;
   let pageView = null;
@@ -90,7 +109,7 @@ export async function startLogin() {
     } else if (st.state === 'failed') {
       failed('Não foi possível entrar', st.error || 'o login foi recusado', 'Tentar de novo', () => {
         close();
-        startLogin();
+        startStreamLogin();
       });
       return;
     } else {

@@ -90,5 +90,13 @@ export const api = {
     return j.ok;
   }),
   loginCancel: (id) => post(`/api/login/${id}/cancel`),
+  // the sign-in whose page runs in this browser (see sjlogin.js)
+  loginDirectPage: () => get('/api/login/direct/page').then((j) => {
+    if ('err' in j) throw new Error(j.err);
+    return j.ok;
+  }),
+  loginDirectStart: () => post('/api/login/direct/start').then((r) => r.id),
+  loginDirectMessage: (id, body) => post(`/api/login/direct/${id}/message`, { body }),
+  loginDirectCancel: (id) => post(`/api/login/direct/${id}/cancel`),
   checkout: (xuid, productId) => post('/api/checkout', { xuid, productId }),
 };

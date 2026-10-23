@@ -98,8 +98,64 @@ pub struct Logins {
     map: Mutex<HashMap<String, Status>>,
     /// The sign-ins in progress, by id.
     live: Mutex<HashMap<String, Live>>,
+    /// The sign-ins whose page runs in the person's own browser: only the core's side of them is
+    /// here (its pending sign-in, under the same id), and when each was last heard from.
+    direct: Mutex<HashMap<String, std::time::Instant>>,
     /// The sweep of abandoned sign-ins is running.
     sweeping: std::sync::atomic::AtomicBool,
+}
+
+/// How many sign-ins of that kind may be open at once. They cost the server almost nothing (no
+/// browser page), so many people can be at it together.
+const MAX_DIRECT: usize = 80;
+/// How long one may sit without a word from its page before it is dropped.
+const DIRECT_IDLE: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+
+impl Logins {
+    /// Begin a sign-in whose page runs in the person's browser: register the device with
+    /// Microsoft and keep the core's pending sign-in under a new id.
+    pub async fn direct_start(self: &Arc<Self>, host: &Host) -> Result<String, String> {
+        self.sweep(host);
+        if self.direct.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len() >= MAX_DIRECT {
+            return Err("há logins demais em andamento; tente de novo em instantes".into());
+        }
+        let mut b = [0u8; 8];
+        let _ = getrandom::getrandom(&mut b);
+        let id: String = b.iter().map(|x| format!("{x:02x}")).collect();
+        dispatch("windows_login_start", &json!({ "login": id })).await.map_err(|e| e.to_string())?;
+        self.direct.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(id.clone(), std::time::Instant::now());
+        Ok(id)
+    }
+
+    /// One message the page posted to its bridge: the core says what it means (a script to run in
+    /// the page, another page to load, or that the sign-in is done).
+    pub async fn direct_message(&self, id: &str, body: &str) -> Result<Value, String> {
+        {
+            let mut d = self.direct.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(seen) = d.get_mut(id) else { return Err("este login já terminou".into()) };
+            *seen = std::time::Instant::now();
+        }
+        match dispatch("windows_login_message", &json!({ "login": id, "body": body })).await {
+            Ok(v) => {
+                if v["action"].as_str() == Some("done") {
+                    self.direct.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(id);
+                }
+                Ok(v)
+            }
+            Err(e) => {
+                // The core ends the sign-in on an error.
+                self.direct.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(id);
+                Err(e.to_string())
+            }
+        }
+    }
+
+    pub async fn direct_cancel(&self, id: &str) {
+        let had = self.direct.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(id).is_some();
+        if had {
+            let _ = dispatch("windows_login_cancel", &json!({ "login": id })).await;
+        }
+    }
 }
 
 /// Held while a live picture is open on a sign-in; it counts as the person being there.
@@ -144,6 +200,18 @@ impl Logins {
                 for id in gone {
                     tracing::info!("login {id} abandonado: encerrado");
                     logins.cancel(&host, &id).await;
+                }
+                let stale: Vec<String> = logins
+                    .direct
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .iter()
+                    .filter(|(_, seen)| now.saturating_duration_since(**seen) > DIRECT_IDLE)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for id in stale {
+                    tracing::info!("login {id} (no navegador) sem notícias: encerrado");
+                    logins.direct_cancel(&id).await;
                 }
             }
         });
