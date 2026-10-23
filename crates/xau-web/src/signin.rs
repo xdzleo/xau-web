@@ -44,19 +44,38 @@ impl Status {
     }
 }
 
+/// How many people can be signing in at the same moment (each is a browser page on the server).
+const MAX_AT_ONCE: usize = 6;
+
+type FramesRx = tokio::sync::watch::Receiver<Option<bytes::Bytes>>;
+
+/// One sign-in's windows and live picture. Every person signing in has their own.
+struct Live {
+    /// The sign-in's own window.
+    main: u64,
+    /// The window shown now: the sign-in's, or the sign-up's beside it.
+    win: u64,
+    /// The shown window's live picture (JPEG frames pushed by the engine).
+    frames: Option<FramesRx>,
+    /// The size (CSS px, density) the page was last given, to resize it only when the person's screen changes.
+    view: (u32, u32, u32),
+    /// Windows opened beside the sign-in (the sign-up), closed with it.
+    side: Vec<u64>,
+    /// The window shown changed (sign-in <-> sign-up): this person's live picture reconnects.
+    swapped: Arc<tokio::sync::Notify>,
+}
+
+impl Live {
+    fn new(win: u64, frames: Option<FramesRx>) -> Self {
+        Live { main: win, win, frames, view: (412, 860, 175), side: Vec::new(), swapped: Arc::default() }
+    }
+}
+
 #[derive(Default)]
 pub struct Logins {
     map: Mutex<HashMap<String, Status>>,
-    /// The window of the sign-in in progress, to close it on cancel.
-    window: Mutex<Option<(String, u64)>>,
-    /// The size (CSS px, density) the page was last given, to resize it only when the site's screen changes.
-    view: Mutex<(u32, u32, u32)>,
-    /// The page's live picture (JPEG frames pushed by the engine), for the sign-in in progress.
-    frames: Mutex<Option<(String, tokio::sync::watch::Receiver<Option<bytes::Bytes>>)>>,
-    /// The window shown changed (sign-in <-> sign-up): live pictures reconnect to the new one.
-    pub swapped: tokio::sync::Notify,
-    /// Windows opened beside the sign-in (the sign-up), closed with it.
-    side: Mutex<Vec<u64>>,
+    /// The sign-ins in progress, by id.
+    live: Mutex<HashMap<String, Live>>,
 }
 
 impl Logins {
@@ -68,31 +87,37 @@ impl Logins {
         self.map.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(id).cloned()
     }
 
-    fn busy(&self) -> bool {
-        self.map
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .values()
-            .any(|s| !s.finished())
+    fn running(&self) -> usize {
+        self.map.lock().unwrap_or_else(std::sync::PoisonError::into_inner).values().filter(|s| !s.finished()).count()
+    }
+
+    fn with_live<R>(&self, id: &str, f: impl FnOnce(&mut Live) -> R) -> Option<R> {
+        self.live.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_mut(id).map(f)
+    }
+
+    /// Wakes when the window shown for this sign-in changes (None: no such sign-in).
+    pub fn swapped(&self, id: &str) -> Option<Arc<tokio::sync::Notify>> {
+        self.with_live(id, |l| l.swapped.clone())
+    }
+
+    /// The sign-in is over: its windows close, and its record goes.
+    fn end(&self, host: &Host, id: &str) -> bool {
+        let Some(live) = self.live.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(id) else {
+            return false;
+        };
+        for w in live.side {
+            host.close(w);
+        }
+        host.close(live.main);
+        true
     }
 
     /// The user cancelled from the page: close the window.
     pub async fn cancel(&self, host: &Host, id: &str) {
-        let win = {
-            let mut slot = self.window.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            match &*slot {
-                Some((wid, _)) if wid == id => slot.take(),
-                _ => None,
-            }
-        };
-        if let Some((_, win)) = win {
+        if self.end(host, id) {
             // Closing the window from here tells nobody, so the sign-in is ended here.
-            let _ = dispatch("windows_login_cancel", &json!({})).await;
+            let _ = dispatch("windows_login_cancel", &json!({ "login": id })).await;
             self.set(id, Status::Cancelled);
-            host.close(win);
-        }
-        for w in std::mem::take(&mut *self.side.lock().unwrap_or_else(std::sync::PoisonError::into_inner)) {
-            host.close(w);
         }
     }
 }
@@ -107,22 +132,20 @@ pub struct Frame {
 
 impl Logins {
     fn window_of(&self, id: &str) -> Result<u64, String> {
-        match &*self.window.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
-            Some((wid, win)) if wid == id => Ok(*win),
-            _ => Err("este login já terminou".into()),
-        }
+        self.with_live(id, |l| l.win).ok_or_else(|| "este login já terminou".into())
     }
 
     /// Give the page the size of the site's screen for it (CSS px) and the person's display density,
     /// so there are no borders and a touch lands where it is drawn.
-    async fn set_view(&self, host: &Host, win: u64, width: u32, height: u32, density: u32) -> Result<(), String> {
+    async fn set_view(&self, host: &Host, id: &str, win: u64, width: u32, height: u32, density: u32) -> Result<(), String> {
         let want = (width.clamp(240, 1200), height.clamp(300, 2000), density.clamp(100, 300));
-        let changed = {
-            let mut v = self.view.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let changed = *v != want;
-            *v = want;
-            changed
-        };
+        let changed = self
+            .with_live(id, |l| {
+                let changed = l.view != want;
+                l.view = want;
+                changed
+            })
+            .unwrap_or(false);
         if changed {
             let p = json!({ "width": want.0, "height": want.1, "deviceScaleFactor": f64::from(want.2) / 100.0, "mobile": true });
             host.cdp(win, "Emulation.setDeviceMetricsOverride", &p.to_string()).await?;
@@ -151,11 +174,8 @@ impl Logins {
         density: u32,
     ) -> Result<tokio::sync::watch::Receiver<Option<bytes::Bytes>>, String> {
         let win = self.window_of(id)?;
-        let rx = match &*self.frames.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
-            Some((fid, rx)) if fid == id => rx.clone(),
-            _ => return Err("este login não tem imagem ao vivo".into()),
-        };
-        self.set_view(host, win, width, height, density).await?;
+        let rx = self.with_live(id, |l| l.frames.clone()).flatten().ok_or("este login não tem imagem ao vivo")?;
+        self.set_view(host, id, win, width, height, density).await?;
         Ok(rx)
     }
 
@@ -173,7 +193,7 @@ impl Logins {
     pub async fn frame(&self, host: &Host, id: &str, width: u32, height: u32, density: u32) -> Result<Frame, String> {
         use base64::Engine;
         let win = self.window_of(id)?;
-        self.set_view(host, win, width, height, density).await?;
+        self.set_view(host, id, win, width, height, density).await?;
         let (shot, editing) = tokio::join!(
             host.cdp(win, "Page.captureScreenshot", r#"{"format":"jpeg","quality":70}"#),
             Self::editing(host, win),
@@ -275,12 +295,15 @@ fn s(v: &Value, key: &str) -> String {
 /// Open the sign-in window and drive it in the background. Returns the id
 /// to poll with [`Logins::get`].
 pub async fn start(host: Host, logins: Arc<Logins>) -> Result<String, String> {
-    // The window is modal in spirit: two at once would race over the
-    // core's single pending sign-in.
-    if logins.busy() {
-        return Err("já existe um login em andamento: termine ou feche a janela".into());
+    // Several people can sign in at once: each sign-in has its own id, its own window here, and
+    // its own pending sign-in in the core (under the same id).
+    if logins.running() >= MAX_AT_ONCE {
+        return Err(format!("já há {MAX_AT_ONCE} logins em andamento ao mesmo tempo; tente de novo em instantes"));
     }
-    let page = dispatch("windows_login_start", &json!({})).await.map_err(|e| e.to_string())?;
+    let mut b = [0u8; 8];
+    let _ = getrandom::getrandom(&mut b);
+    let id: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    let page = dispatch("windows_login_start", &json!({ "login": id })).await.map_err(|e| e.to_string())?;
 
     let headers: Vec<(String, String)> = page["headers"]
         .as_array()
@@ -320,14 +343,11 @@ pub async fn start(host: Host, logins: Arc<Logins>) -> Result<String, String> {
     let (win, mut rx) = match host.open_sign_in(spec) {
         Ok(h) => h,
         Err(e) => {
-            let _ = dispatch("windows_login_cancel", &json!({})).await;
+            let _ = dispatch("windows_login_cancel", &json!({ "login": id })).await;
             return Err(e);
         }
     };
 
-    let mut b = [0u8; 8];
-    let _ = getrandom::getrandom(&mut b);
-    let id: String = b.iter().map(|x| format!("{x:02x}")).collect();
     logins.set(&id, Status::Waiting);
     // Under Microsoft's page, the app's own dark, as in the app's WebView (it does not fill the screen).
     if spec_hidden {
@@ -360,9 +380,8 @@ pub async fn start(host: Host, logins: Arc<Logins>) -> Result<String, String> {
         if let Err(e) = host.cdp(win, "Page.startScreencast", &screencast_params()).await {
             tracing::warn!("sign-in screencast: {e}");
         }
-    }    *logins.window.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((id.clone(), win));
-    *logins.frames.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = frames_rx.map(|rx| (id.clone(), rx));
-    *logins.view.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = (412, 860, 175);
+    }
+    logins.live.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(id.clone(), Live::new(win, frames_rx));
 
     let task_id = id.clone();
     tokio::spawn(async move {
@@ -381,7 +400,7 @@ pub async fn start(host: Host, logins: Arc<Logins>) -> Result<String, String> {
                 }
                 WinEvent::Message(body) => match {
                     tracing::debug!("sign-in page says: {}", body.chars().take(400).collect::<String>());
-                    dispatch("windows_login_message", &json!({ "body": body })).await
+                    dispatch("windows_login_message", &json!({ "login": task_id, "body": body })).await
                 } {
                     Ok(v) => match v["action"].as_str() {
                         Some("eval") => host.eval(win, s(&v, "script")),
@@ -403,14 +422,12 @@ pub async fn start(host: Host, logins: Arc<Logins>) -> Result<String, String> {
                             }
                             let warning = v["warning"].as_str().map(str::to_string);
                             logins.set(&task_id, Status::Done { accounts, warning });
-                            host.close(win);
                         }
                         _ => {}
                     },
                     Err(e) => {
                         finished = true;
                         logins.set(&task_id, Status::Failed(e.to_string()));
-                        host.close(win);
                     }
                 },
                 WinEvent::Leave { url, to_signup: true } => {
@@ -421,17 +438,17 @@ pub async fn start(host: Host, logins: Arc<Logins>) -> Result<String, String> {
                 WinEvent::Leave { .. } => {}
                 WinEvent::Closed => {
                     finished = true;
-                    let _ = dispatch("windows_login_cancel", &json!({})).await;
+                    let _ = dispatch("windows_login_cancel", &json!({ "login": task_id })).await;
                     logins.set(&task_id, Status::Cancelled);
                 }
                 WinEvent::Failed(e) => {
                     finished = true;
-                    let _ = dispatch("windows_login_cancel", &json!({})).await;
+                    let _ = dispatch("windows_login_cancel", &json!({ "login": task_id })).await;
                     logins.set(&task_id, Status::Failed(e));
                 }
             }
             if finished {
-                *logins.window.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                logins.end(&host, &task_id);
             }
         }
     });
@@ -460,9 +477,7 @@ pub async fn start_bench(host: Host, logins: Arc<Logins>, url: String, windows_u
         frames: Some(tx),
         side: false,
     };
-    if let Some((_, old)) = logins.window.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
-        host.close(old);
-    }
+    logins.end(&host, "bench");
     let (win, mut rx) = host.open_sign_in(spec)?;
     for (method, params) in [
         ("Emulation.setDeviceMetricsOverride", r#"{"width":412,"height":860,"deviceScaleFactor":1.75,"mobile":true}"#),
@@ -474,9 +489,7 @@ pub async fn start_bench(host: Host, logins: Arc<Logins>, url: String, windows_u
     host.cdp(win, "Page.startScreencast", &screencast_params()).await?;
     let id = "bench".to_string();
     logins.set(&id, Status::Waiting);
-    *logins.window.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((id.clone(), win));
-    *logins.frames.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((id.clone(), frames_rx));
-    *logins.view.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = (412, 860, 175);
+    logins.live.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(id.clone(), Live::new(win, Some(frames_rx)));
     tokio::spawn(async move { while rx.recv().await.is_some() {} });
     Ok(id)
 }
@@ -505,18 +518,27 @@ async fn open_signup(host: &Host, logins: &Arc<Logins>, id: &str, main_win: u64,
         side: true,
     };
     let (side_win, mut events) = host.open_sign_in(spec)?;
-    logins.side.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(side_win);
-    let (w, h, d) = *logins.view.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some((w, h, d)) = logins.with_live(id, |l| {
+        l.side.push(side_win);
+        l.view
+    }) else {
+        host.close(side_win);
+        return Err("este login já terminou".into());
+    };
     let metrics = json!({ "width": w, "height": h, "deviceScaleFactor": f64::from(d) / 100.0, "mobile": true }).to_string();
     host.cdp(side_win, "Emulation.setDeviceMetricsOverride", &metrics).await?;
     host.cdp(side_win, "Emulation.setTouchEmulationEnabled", r#"{"enabled":true,"maxTouchPoints":5}"#).await?;
     host.load(side_win, url, Vec::new());
     host.cdp(side_win, "Page.startScreencast", &screencast_params()).await?;
 
-    let main_frames = logins.frames.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref().map(|(_, rx)| rx.clone());
-    *logins.window.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((id.to_string(), side_win));
-    *logins.frames.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((id.to_string(), side_frames));
-    logins.swapped.notify_waiters();
+    let main_frames = logins
+        .with_live(id, |l| {
+            let main = l.frames.replace(side_frames);
+            l.win = side_win;
+            l.swapped.notify_waiters();
+            main
+        })
+        .flatten();
     // Out of sight meanwhile, the sign-in page starts over: it was left mid-way (dimmed, waiting)
     // by the link it followed, and must be clean when the person comes back.
     let _ = host.cdp(main_win, "Page.reload", "{}").await;
@@ -529,15 +551,15 @@ async fn open_signup(host: &Host, logins: &Arc<Logins>, id: &str, main_win: u64,
             }
         }
         host.close(side_win);
-        logins.side.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|w| *w != side_win);
         // Back to the sign-in, if it is still going.
-        let mut slot = logins.window.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if matches!(&*slot, Some((wid, w)) if *wid == id && *w == side_win) {
-            *slot = Some((id.clone(), main_win));
-            drop(slot);
-            *logins.frames.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = main_frames.map(|rx| (id, rx));
-            logins.swapped.notify_waiters();
-        }
+        logins.with_live(&id, |l| {
+            l.side.retain(|w| *w != side_win);
+            if l.win == side_win {
+                l.win = main_win;
+                l.frames = main_frames;
+                l.swapped.notify_waiters();
+            }
+        });
     });
     Ok(())
 }

@@ -373,6 +373,8 @@ async fn login_ws_session(
 ) {
     use axum::extract::ws::Message;
     let (reply_tx, mut replies) = tokio::sync::mpsc::unbounded_channel::<bool>();
+    // This person's sign-in only: another person's sign-up opening does not touch this picture.
+    let swapped = app.logins.swapped(&id).unwrap_or_default();
     // Once the page holds still, a sharp picture replaces the last (CSS-pixel) screencast frame.
     const STILL: std::time::Duration = std::time::Duration::from_millis(120);
     let mut sharpen_at: Option<tokio::time::Instant> = None;
@@ -447,7 +449,7 @@ async fn login_ws_session(
                     Err(e) => tracing::debug!("login ws input: {e}"),
                 }
             }
-            () = app.logins.swapped.notified() => break, // another window is shown: the page reconnects
+            () = swapped.notified() => break, // another window is shown: the page reconnects
             Some(editing) = replies.recv() => {
                 if socket.send(Message::Text(json!({ "editing": editing }).to_string())).await.is_err() {
                     break;
