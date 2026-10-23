@@ -375,6 +375,8 @@ async fn login_ws_session(
     let (reply_tx, mut replies) = tokio::sync::mpsc::unbounded_channel::<bool>();
     // This person's sign-in only: another person's sign-up opening does not touch this picture.
     let swapped = app.logins.swapped(&id).unwrap_or_default();
+    // While this is open the person is there; once nobody is, the sign-in is ended after a while.
+    let _viewer = app.logins.viewer(&id);
     // Once the page holds still, a sharp picture replaces the last (CSS-pixel) screencast frame.
     const STILL: std::time::Duration = std::time::Duration::from_millis(120);
     let mut sharpen_at: Option<tokio::time::Instant> = None;

@@ -63,19 +63,91 @@ struct Live {
     side: Vec<u64>,
     /// The window shown changed (sign-in <-> sign-up): this person's live picture reconnects.
     swapped: Arc<tokio::sync::Notify>,
+    /// Live pictures open on it now (a WebSocket each).
+    viewers: usize,
+    /// When the person last showed signs of being there (a picture asked for, an input, a viewer leaving).
+    seen: std::time::Instant,
 }
 
 impl Live {
     fn new(win: u64, frames: Option<FramesRx>) -> Self {
-        Live { main: win, win, frames, view: (412, 860, 175), side: Vec::new(), swapped: Arc::default() }
+        Live {
+            main: win,
+            win,
+            frames,
+            view: (412, 860, 175),
+            side: Vec::new(),
+            swapped: Arc::default(),
+            viewers: 0,
+            seen: std::time::Instant::now(),
+        }
+    }
+
+    /// Nobody is looking at it, and nobody has for a while: the tab was closed, the phone locked
+    /// for good, the person gave up. It holds a whole browser page on the server, so it goes.
+    fn abandoned(&self, now: std::time::Instant) -> bool {
+        self.viewers == 0 && now.saturating_duration_since(self.seen) > ABANDONED_AFTER
     }
 }
+
+/// How long a sign-in with nobody watching it is kept before it is ended.
+const ABANDONED_AFTER: std::time::Duration = std::time::Duration::from_secs(90);
 
 #[derive(Default)]
 pub struct Logins {
     map: Mutex<HashMap<String, Status>>,
     /// The sign-ins in progress, by id.
     live: Mutex<HashMap<String, Live>>,
+    /// The sweep of abandoned sign-ins is running.
+    sweeping: std::sync::atomic::AtomicBool,
+}
+
+/// Held while a live picture is open on a sign-in; it counts as the person being there.
+pub struct Viewer {
+    logins: Arc<Logins>,
+    id: String,
+}
+
+impl Drop for Viewer {
+    fn drop(&mut self) {
+        self.logins.with_live(&self.id, |l| {
+            l.viewers = l.viewers.saturating_sub(1);
+            l.seen = std::time::Instant::now();
+        });
+    }
+}
+
+impl Logins {
+    /// A live picture opened on this sign-in (None: no such sign-in).
+    pub fn viewer(self: &Arc<Self>, id: &str) -> Option<Viewer> {
+        self.with_live(id, |l| l.viewers += 1).map(|()| Viewer { logins: self.clone(), id: id.to_string() })
+    }
+
+    /// End, now and then, the sign-ins nobody is at any more (started with the first sign-in).
+    fn sweep(self: &Arc<Self>, host: &Host) {
+        if self.sweeping.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let (logins, host) = (self.clone(), host.clone());
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                let now = std::time::Instant::now();
+                let gone: Vec<String> = logins
+                    .live
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .iter()
+                    .filter(|(_, l)| l.abandoned(now))
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for id in gone {
+                    tracing::info!("login {id} abandonado: encerrado");
+                    logins.cancel(&host, &id).await;
+                }
+            }
+        });
+    }
 }
 
 impl Logins {
@@ -132,7 +204,11 @@ pub struct Frame {
 
 impl Logins {
     fn window_of(&self, id: &str) -> Result<u64, String> {
-        self.with_live(id, |l| l.win).ok_or_else(|| "este login já terminou".into())
+        self.with_live(id, |l| {
+            l.seen = std::time::Instant::now();
+            l.win
+        })
+        .ok_or_else(|| "este login já terminou".into())
     }
 
     /// Give the page the size of the site's screen for it (CSS px) and the person's display density,
@@ -382,6 +458,7 @@ pub async fn start(host: Host, logins: Arc<Logins>) -> Result<String, String> {
         }
     }
     logins.live.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(id.clone(), Live::new(win, frames_rx));
+    logins.sweep(&host);
 
     let task_id = id.clone();
     tokio::spawn(async move {
@@ -562,4 +639,21 @@ async fn open_signup(host: &Host, logins: &Arc<Logins>, id: &str, main_win: u64,
         });
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn only_a_sign_in_nobody_watches_for_a_while_is_abandoned() {
+        let now = Instant::now();
+        let mut l = Live::new(1, None);
+        l.seen = now;
+        assert!(!l.abandoned(now + Duration::from_secs(30)), "a moment away is not leaving");
+        assert!(l.abandoned(now + ABANDONED_AFTER + Duration::from_secs(1)));
+        l.viewers = 1;
+        assert!(!l.abandoned(now + Duration::from_secs(3600)), "someone is looking at it");
+    }
 }
