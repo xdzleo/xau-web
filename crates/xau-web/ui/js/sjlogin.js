@@ -30,6 +30,10 @@ const INLINE_LOGIN = 'https://login.live.com/ppsecure/InlineLogin.srf';
 /** Microsoft's sign-up runs as an ordinary phone page (the Windows-hosted one waits forever). */
 const SIGNUP_UA = 'Mozilla/5.0 (Linux; Android 15; moto g34 5G) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Mobile Safari/537.36';
 const LANGUAGES = 'pt-BR,en-US;q=0.9';
+/** What the phone of SIGNUP_UA says about itself: the page's bot checks compare it with the address bar's every word. */
+const PHONE_BRANDS = [{ brand: 'Android WebView', version: '153' }, { brand: 'Not_A Brand', version: '8' }, { brand: 'Chromium', version: '153' }];
+const PHONE_HINTS = PHONE_BRANDS.map((b) => `"${b.brand}";v="${b.version}"`).join(', ');
+const PHONE_DATA = { platform: 'Android', platformVersion: '15.0.0', architecture: '', model: 'moto g34 5G', uaFullVersion: '153.0.0.0', mobile: true, brands: PHONE_BRANDS };
 
 const TIMEOUTS = window.__sjTimeouts || {}; // (the tests shorten these)
 const RUNTIME_TIMEOUT = TIMEOUTS.runtime ?? 25_000; // the runtime (scripts, service worker, transport) must be up by then
@@ -221,6 +225,26 @@ function setHeader(init, name, value) {
   } else init.headers = [[name, value]];
 }
 
+/** Take a request header out, in whatever shape the transport's request has it. */
+function dropHeader(init, match) {
+  const hs = init.headers;
+  if (Array.isArray(hs)) init.headers = hs.filter(([k]) => !match(String(k).toLowerCase()));
+  else if (typeof Headers !== 'undefined' && hs instanceof Headers) [...hs.keys()].filter(match).forEach((k) => hs.delete(k));
+  else if (hs && typeof hs === 'object') Object.keys(hs).filter((k) => match(k.toLowerCase())).forEach((k) => delete hs[k]);
+}
+
+/** The page sees the same browser its requests say they come from: the sign-up's phone, or the Windows web host (which has no `userAgentData`). */
+function applyIdentity(w, spec, phone) {
+  const set = (name, value) => Object.defineProperty(w.navigator, name, { get: () => value, configurable: true });
+  try {
+    set('userAgent', phone ? SIGNUP_UA : spec.user_agent);
+    set('appVersion', (phone ? SIGNUP_UA : spec.user_agent).replace('Mozilla/', ''));
+    set('platform', 'Linux aarch64');
+    set('maxTouchPoints', phone ? 5 : 0);
+    set('userAgentData', phone ? { brands: PHONE_BRANDS, mobile: true, platform: 'Android', getHighEntropyValues: async () => PHONE_DATA, toJSON: () => ({ brands: PHONE_BRANDS, mobile: true, platform: 'Android' }) } : undefined);
+  } catch {}
+}
+
 /** Microsoft's sign-up link carries the Windows host's marks, and the page then waits for the host forever. */
 function unhostedSignup(href) {
   // Text, not URLSearchParams: what stays must stay byte for byte (the same as `unhosted_signup` in webhost.rs).
@@ -298,11 +322,20 @@ function pluginClass(Base) {
       // Every request to Microsoft is the Windows web host's; the first one for the sign-in page carries its marks.
       this.tap(frame.hooks.fetch.request, (c, p) => {
         const host = p.url.hostname;
-        if (!MS.test(host)) return;
-        const signup = host === 'signup.live.com';
+        const signup = host === 'signup.live.com' || page.inSignup; // the sign-up's helpers (its bot check too) see the same phone
+        if (!MS.test(host) && !signup) return;
         window.__sjTrace?.('request', p.url.href.slice(0, 100));
         setHeader(p.init, 'User-Agent', signup ? SIGNUP_UA : page.spec.user_agent);
         setHeader(p.init, 'Accept-Language', LANGUAGES);
+        // This browser's own version and system would contradict that name, and no browser says where an image request comes from.
+        const secHint = (k) => k.startsWith('sec-ch-ua');
+        dropHeader(p.init, secHint);
+        if (signup) {
+          setHeader(p.init, 'sec-ch-ua', PHONE_HINTS);
+          setHeader(p.init, 'sec-ch-ua-mobile', '?1');
+          setHeader(p.init, 'sec-ch-ua-platform', '"Android"');
+        }
+        if (c.parsed.destination && !['document', 'iframe', 'empty'].includes(c.parsed.destination) && String(p.init.method || 'GET').toUpperCase() === 'GET') dropHeader(p.init, (k) => k === 'origin');
         if (!signup && page.marks && ['document', 'iframe'].includes(c.parsed.destination) && p.url.pathname.toLowerCase() === '/ppsecure/inlinelogin.srf') {
           page.marks = false;
           for (const [k, v] of page.spec.headers) setHeader(p.init, k, v);
@@ -312,17 +345,11 @@ function pluginClass(Base) {
 
       // Each page gets the host's bridge before its own scripts run.
       this.tap(frame.hooks.init.post, (c) => {
-        if (!c.isTopLevel) return;
         const w = c.window;
+        applyIdentity(w, page.spec, page.inSignup || String(c.client?.url?.hostname || '') === 'signup.live.com');
+        if (!c.isTopLevel) return;
         page.win = w;
         page.client = c.client;
-        const signup = String(c.client?.url?.hostname || '') === 'signup.live.com';
-        try {
-          if (!signup) {
-            Object.defineProperty(w.navigator, 'userAgent', { get: () => page.spec.user_agent, configurable: true });
-            Object.defineProperty(w.navigator, 'platform', { get: () => 'Linux aarch64', configurable: true });
-          }
-        } catch {}
         // A passkey belongs to Microsoft's own address, which this page does not have, so it can never work here:
         // a page that sees no WebAuthn does not offer it and asks for the password, as in the app's WebView.
         try {
