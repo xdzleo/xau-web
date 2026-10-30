@@ -146,6 +146,20 @@ function loadRuntime() {
     const wisp = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/wisp/`;
     const transport = new window.LibcurlTransport.LibcurlClient({ wisp });
     const controller = new Controller({ serviceworker: sw, transport });
+    // A worker that started again (or a new version of it) knows no controller and asks for one. Scramjet has its
+    // own call for this but ignores it for 5 s after starting, and it would keep talking to a replaced worker, so
+    // this answer replaces it. Once per start of the worker: answering again closes the port the first answer
+    // opened, and a request on its way through that port never gets a response.
+    Object.defineProperty(controller, 'guardServiceWorkerRevive', { get: () => true, set() {} });
+    let answered = null;
+    navigator.serviceWorker.addEventListener('message', (e) => {
+      const start = e.data?.$xauNeedController;
+      if (!start || start === answered) return;
+      answered = start;
+      mark('runtime:reconnect');
+      controller.serviceWorkerController = e.source;
+      controller.setupMessagePort();
+    });
     warmUp(transport).catch(() => {});
     await controller.wait();
     mark('runtime:ready');
