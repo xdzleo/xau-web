@@ -320,6 +320,12 @@ function pluginClass(Base) {
             Object.defineProperty(w.navigator, 'platform', { get: () => 'Linux aarch64', configurable: true });
           }
         } catch {}
+        // A passkey belongs to Microsoft's own address, which this page does not have, so it can never work here:
+        // a page that sees no WebAuthn does not offer it and asks for the password, as in the app's WebView.
+        try {
+          Object.defineProperty(w, 'PublicKeyCredential', { value: undefined, configurable: true, writable: true });
+          Object.defineProperty(w.navigator, 'credentials', { value: undefined, configurable: true });
+        } catch {}
         const bridge = { postMessage: (m) => page.fromPage(String(m)) };
         try {
           Object.defineProperty(w, page.spec.bridge, { value: bridge, configurable: true, writable: true });
