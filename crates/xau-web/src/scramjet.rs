@@ -86,12 +86,16 @@ impl Files {
     /// The browser stops an idle worker after some seconds and starts it again for the next
     /// request, and a started worker knows no controller until the page answers its call (about
     /// 100 ms later). The request that woke it (the email's lookup, a link) must wait for that:
-    /// let through, it reaches this server instead of Microsoft and the page hangs.
+    /// let through, it reaches this server instead of Microsoft and the page hangs. Scramjet's own
+    /// call is ignored for 5 s after the page starts, so the worker keeps asking with a message of
+    /// its own (`$xauNeedController`, answered in `sjlogin.js`).
     pub fn service_worker(&self) -> String {
         format!(
             "importScripts(\"/sj/{v}/controller/controller.sw.js\");\n\
+             const start = Math.random();\n\
              const revived = async (e) => {{\n\
              \tfor (let i = 0; i < 250 && !$scramjetController.shouldRoute(e); i++) {{\n\
+             \t\tif (i % 10 === 0) for (const c of await clients.matchAll({{ type: \"window\", includeUncontrolled: true }})) c.postMessage({{ $xauNeedController: start }});\n\
              \t\tawait new Promise((r) => setTimeout(r, 20));\n\
              \t}}\n\
              \tif ($scramjetController.shouldRoute(e)) return $scramjetController.route(e);\n\
