@@ -82,12 +82,26 @@ impl Files {
 
     /// The service worker that carries the page's requests: it only answers the ones for the
     /// sign-in page's own prefix (`/~/sj/`), and leaves everything else of the site alone.
+    ///
+    /// The browser stops an idle worker after some seconds and starts it again for the next
+    /// request, and a started worker knows no controller until the page answers its call (about
+    /// 100 ms later). The request that woke it (the email's lookup, a link) must wait for that:
+    /// let through, it reaches this server instead of Microsoft and the page hangs.
     pub fn service_worker(&self) -> String {
         format!(
             "importScripts(\"/sj/{v}/controller/controller.sw.js\");\n\
+             const revived = async (e) => {{\n\
+             \tfor (let i = 0; i < 250 && !$scramjetController.shouldRoute(e); i++) {{\n\
+             \t\tawait new Promise((r) => setTimeout(r, 20));\n\
+             \t}}\n\
+             \tif ($scramjetController.shouldRoute(e)) return $scramjetController.route(e);\n\
+             \treturn new Response(\"service worker sem o controlador\", {{ status: 503 }});\n\
+             }};\n\
              addEventListener(\"fetch\", (e) => {{\n\
              \tif ($scramjetController.shouldRoute(e)) {{\n\
              \t\te.respondWith($scramjetController.route(e));\n\
+             \t}} else if (new URL(e.request.url).pathname.startsWith(\"/~/sj/\")) {{\n\
+             \t\te.respondWith(revived(e));\n\
              \t}}\n\
              }});\n",
             v = self.version
