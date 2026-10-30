@@ -36,6 +36,9 @@ const RUNTIME_TIMEOUT = TIMEOUTS.runtime ?? 25_000; // the runtime (scripts, ser
 const FIELD_TIMEOUT = TIMEOUTS.field ?? 25_000; // the page must show its field by then, counted from when it is wanted
 const PAGE_LIFETIME = 4 * 60_000; // a page loaded ahead and left this long is loaded again
 const KEEP_PRELOADED = 10 * 60_000; // ...and one nobody asked for in this long is dropped
+const SCAN_EVERY = 500;
+/** What Microsoft's page says when something it needs did not get through: the other way can still sign the person in. */
+const BROKEN = /There was an issue looking up your account|We ran into a problem|Request timeout|Ocorreu um problema|Tempo limite da solicitação/i;
 
 // Marks of the work, for measuring (window.__sj in the console).
 const dbg = (window.__sj = { t0: performance.now(), marks: [], entry: null });
@@ -429,17 +432,18 @@ class Page {
 
 function makeScreen() {
   const cancel = h('button', { class: 'ghostbtn' }, 'Cancelar');
+  const other = h('button', { class: 'ghostbtn' }, 'Outro modo');
   const wait = h('div', { class: 'sjwait' }, h('p', { class: 'body t2' }, 'Abrindo a página da Microsoft…'), skeleton(220, 24), skeleton(320, 15), skeleton(280, 15));
   const iframe = h('iframe', { class: 'sjframe', title: 'Página de login da Microsoft', referrerpolicy: 'no-referrer' });
   const stage = h('div', { class: 'loginstage sjstage' }, iframe, wait);
   const root = h(
     'div',
     { class: 'loginscreen sj stash', role: 'dialog', 'aria-label': 'Entrar na conta' },
-    h('div', { class: 'loginbar' }, icon('xbox', 'loginic'), h('span', { class: 'row-title' }, 'Entrar na conta'), h('span', { class: 'grow' }), cancel),
+    h('div', { class: 'loginbar' }, icon('xbox', 'loginic'), h('span', { class: 'row-title' }, 'Entrar na conta'), h('span', { class: 'grow' }), other, cancel),
     stage,
   );
   document.body.append(root);
-  return { root, stage, iframe, wait, cancel };
+  return { root, stage, iframe, wait, cancel, other };
 }
 
 // ------------------------------------------------------------------ the entry
@@ -524,11 +528,13 @@ export async function startDirect() {
     let over = false;
     let chain = Promise.resolve();
     let watchdog = 0;
+    let scan = 0;
 
     function end(outcome) {
       if (over) return;
       over = true;
       clearTimeout(watchdog);
+      clearInterval(scan);
       active = false;
       if (id) api.loginDirectCancel(id).catch(() => {});
       teardown(entry);
@@ -543,6 +549,14 @@ export async function startDirect() {
     const retry = () => end('retry');
 
     screen.cancel.onclick = () => end();
+    // The person can always leave for the other way, and is taken there when the page breaks or leaves this site.
+    screen.other.onclick = () => end(new Fallback('a pessoa pediu o outro modo'));
+    scan = setInterval(() => {
+      if (!entry.page || !screen.iframe.isConnected) return;
+      const d = screen.iframe.contentDocument;
+      if (!d) end(new Fallback('a página da Microsoft saiu do site'));
+      else if (BROKEN.test(d.body?.innerText || '')) end(new Fallback('a página da Microsoft falhou'));
+    }, SCAN_EVERY);
     // The page has not opened in time: the other way.
     watchdog = setTimeout(() => {
       if (!entry.page?.ready && !over) end(new Fallback('a página da Microsoft não abriu a tempo'));
@@ -577,6 +591,7 @@ export async function startDirect() {
         if (over) return;
         over = true;
         clearTimeout(watchdog);
+        clearInterval(scan);
         active = false;
         id = null; // done: nothing left to cancel
         teardown(entry);
