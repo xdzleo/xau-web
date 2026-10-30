@@ -51,6 +51,10 @@ const MAX_STREAMS: usize = 48;
 const MAX_SESSIONS: usize = 150;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const PING_EVERY: Duration = Duration::from_secs(25);
+/// A stream with no bytes either way for this long is closed. The WARP tunnel drops connections left
+/// idle without telling anyone, and the browser would send the page's next request (the email's
+/// lookup, a link) down one and wait for an answer that never comes. Closed, it opens a new one.
+const IDLE_CLOSE: Duration = Duration::from_secs(20);
 
 static SESSIONS: AtomicUsize = AtomicUsize::new(0);
 
@@ -233,14 +237,17 @@ async fn run_stream(
         }
     };
     let (mut rd, mut wr) = tcp.into_split();
+    let (touch, mut touched) = mpsc::channel::<()>(1);
 
     let out = to_browser.clone();
+    let touch_rd = touch.clone();
     let mut reader = tokio::spawn(async move {
         let mut buf = vec![0u8; 32 * 1024];
         loop {
             match rd.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
+                    let _ = touch_rd.try_send(());
                     if out.send(packet(T_DATA, id, &buf[..n])).await.is_err() {
                         break;
                     }
@@ -253,6 +260,7 @@ async fn run_stream(
     let mut writer = tokio::spawn(async move {
         let mut written = 0u32;
         while let Some(chunk) = from_browser.recv().await {
+            let _ = touch.try_send(());
             if wr.write_all(&chunk).await.is_err() {
                 break;
             }
@@ -268,9 +276,17 @@ async fn run_stream(
         let _ = wr.shutdown().await;
     });
 
-    tokio::select! {
-        _ = &mut reader => {}
-        _ = &mut writer => {}
+    loop {
+        tokio::select! {
+            _ = &mut reader => break,
+            _ = &mut writer => break,
+            t = tokio::time::timeout(IDLE_CLOSE, touched.recv()) => {
+                if t.is_err() {
+                    tracing::debug!("wisp: #{id} {host}:{port} parado há {}s; fechando", IDLE_CLOSE.as_secs());
+                    break;
+                }
+            }
+        }
     }
     reader.abort();
     writer.abort();
