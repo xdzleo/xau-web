@@ -41,8 +41,6 @@ const FIELD_TIMEOUT = TIMEOUTS.field ?? 25_000; // the page must show its field 
 const PAGE_LIFETIME = 4 * 60_000; // a page loaded ahead and left this long is loaded again
 const KEEP_PRELOADED = 10 * 60_000; // ...and one nobody asked for in this long is dropped
 const SCAN_EVERY = 500;
-/** What Microsoft's page says when something it needs did not get through: the other way can still sign the person in. */
-const BROKEN = /There was an issue looking up your account|We ran into a problem|Request timeout|Ocorreu um problema|Tempo limite da solicitação/i;
 
 // Marks of the work, for measuring (window.__sj in the console).
 const dbg = (window.__sj = { t0: performance.now(), marks: [], entry: null });
@@ -576,13 +574,12 @@ export async function startDirect() {
     const retry = () => end('retry');
 
     screen.cancel.onclick = () => end();
-    // The person can always leave for the other way, and is taken there when the page breaks or leaves this site.
+    // The person can always leave for the other way, and is taken there when the page leaves this site. Microsoft's
+    // own error messages are not a reason: they come with a way forward (try again, use the password) in the page.
     screen.other.onclick = () => end(new Fallback('a pessoa pediu o outro modo'));
     scan = setInterval(() => {
       if (!entry.page || !screen.iframe.isConnected) return;
-      const d = screen.iframe.contentDocument;
-      if (!d) end(new Fallback('a página da Microsoft saiu do site'));
-      else if (BROKEN.test(d.body?.innerText || '')) end(new Fallback('a página da Microsoft falhou'));
+      if (!screen.iframe.contentDocument) end(new Fallback('a página da Microsoft saiu do site'));
     }, SCAN_EVERY);
     // The page has not opened in time: the other way.
     watchdog = setTimeout(() => {
