@@ -5,7 +5,7 @@
 //! and the person say to each other. What it does decide is *where* the bytes may go, and that is
 //! the whole security of this endpoint:
 //!
-//! * only Microsoft's own hosts (and the captcha vendors its sign-in uses), on ports 443 and 80;
+//! * only a real host name, never a raw address, on ports 443 and 80 (see `Policy`);
 //! * only TCP;
 //! * only once the exit is confirmed to be Cloudflare's (see `egress`), and only through that
 //!   proxy: a stream is a SOCKS5 connection to it, never a direct one from this host.
@@ -58,46 +58,21 @@ const IDLE_CLOSE: Duration = Duration::from_secs(20);
 
 static SESSIONS: AtomicUsize = AtomicUsize::new(0);
 
-/// Where a stream may go: Microsoft's domains and the captcha vendors its sign-in uses.
-const DEFAULT_ALLOW: &[&str] = &[
-    "live.com",
-    "microsoft.com",
-    "microsoftonline.com",
-    "msftauth.net",
-    "msauth.net",
-    "msecnd.net",
-    "gfx.ms",
-    "xboxlive.com",
-    "xbox.com",
-    "office.com",
-    "office365.com",
-    "outlook.com",
-    "skype.com",
-    "msn.com",
-    "bing.com",
-    // Captchas and bot checks the sign-in and the sign-up pages load (Arkose Labs, HUMAN/PerimeterX).
-    "arkoselabs.com",
-    "funcaptcha.com",
-    "hcaptcha.com",
-    "hsprotect.net",
-    "px-cloud.net",
-    "px-cdn.net",
-    "perimeterx.net",
-    "pxchk.net",
-];
-
-pub struct Policy {
-    allow: Vec<String>,
-}
+/// Where a stream may go. The sign-in's own frame never leaves Microsoft's domains (the client
+/// keeps it there), but what a page loaded there pulls in along the way — captchas, bot checks, a
+/// cookie-sync beacon — comes from vendor domains (Arkose Labs, HUMAN/PerimeterX and the like) that
+/// rotate through many short-lived aliases no fixed list can keep up with: block on name instead of
+/// listing them meant turning most "Create one!" clicks into a dead captcha widget, or a page stuck
+/// behind a sync pixel that could never load. So this allows any name that looks like a real one, on
+/// a web port, and keeps out only what cannot be a site at all: an address, not a name (DNS happens
+/// at the WARP exit, never here, so this host string is never resolved locally, and an address typed
+/// in its place is refused outright), a name with characters a browser would never send, or a port
+/// that is not 443 or 80.
+pub struct Policy;
 
 impl Policy {
-    /// The defaults, plus the domains in `XAU_WISP_ALLOW` (comma separated).
     pub fn from_env() -> Arc<Self> {
-        let mut allow: Vec<String> = DEFAULT_ALLOW.iter().map(|s| (*s).to_string()).collect();
-        if let Ok(extra) = std::env::var("XAU_WISP_ALLOW") {
-            allow.extend(extra.split(',').map(|d| d.trim().trim_start_matches('.').to_ascii_lowercase()).filter(|d| d.contains('.')));
-        }
-        Arc::new(Self { allow })
+        Arc::new(Self)
     }
 
     /// Whether a stream to `host:port` may be opened.
@@ -106,14 +81,11 @@ impl Policy {
             return false;
         }
         let host = host.trim_end_matches('.');
-        // A name, never an address: the allow-list is about names.
+        // A name, never an address.
         if host.is_empty() || host.len() > 253 || !host.contains('.') || host.parse::<std::net::IpAddr>().is_ok() {
             return false;
         }
-        if !host.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b'_') {
-            return false;
-        }
-        self.allow.iter().any(|d| host == d || host.strip_suffix(d.as_str()).is_some_and(|rest| rest.ends_with('.')))
+        host.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b'_')
     }
 }
 
@@ -429,29 +401,30 @@ mod tests {
     use tokio::net::TcpListener;
 
     fn policy() -> Policy {
-        Policy { allow: DEFAULT_ALLOW.iter().map(|s| (*s).to_string()).collect() }
+        Policy
     }
 
     #[test]
-    fn only_microsofts_names_on_web_ports_are_allowed() {
+    fn any_real_name_on_a_web_port_is_allowed() {
         let p = policy();
         assert!(p.allows("login.live.com", 443));
         assert!(p.allows("logincdn.msftauth.net", 443));
         assert!(p.allows("LOGIN.LIVE.COM.".to_ascii_lowercase().as_str(), 443));
         assert!(p.allows("signup.live.com", 80));
         assert!(p.allows("live.com", 443));
+        assert!(p.allows("crcldu.com", 443), "the sign-up's own cookie sync, one of PerimeterX's rotating aliases");
+        assert!(p.allows("hsprotect.net", 443), "a named bot-check vendor still works");
+        assert!(p.allows("some-other-vendor-abc123.net", 443), "an alias never seen before still works");
         assert!(!p.allows("login.live.com", 22), "not a web port");
         assert!(!p.allows("login.live.com", 8080));
-        assert!(!p.allows("evil.com", 443));
-        assert!(!p.allows("notlive.com", 443), "a suffix of the text is not a subdomain");
-        assert!(!p.allows("live.com.evil.com", 443));
         assert!(!p.allows("127.0.0.1", 443), "an address is not a name");
         assert!(!p.allows("10.0.0.5", 80));
         assert!(!p.allows("[::1]", 443));
-        assert!(!p.allows("localhost", 443));
         assert!(!p.allows("", 443));
-        assert!(!p.allows("login.live.com/evil", 443));
-        assert!(!p.allows("login.live.com@evil.com", 443));
+        assert!(!p.allows("live.com", 0));
+        assert!(!p.allows("live.com/evil", 443), "a path is not part of a host");
+        assert!(!p.allows("live.com@evil.com", 443));
+        assert!(!p.allows(format!("{}.com", "a".repeat(260)).as_str(), 443), "too long to be a real name");
     }
 
     #[test]
