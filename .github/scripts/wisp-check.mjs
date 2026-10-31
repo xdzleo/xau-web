@@ -1,7 +1,8 @@
 // Checks the Wisp relay the way a browser's sign-in page uses it, against a running container:
 //   node wisp-check.mjs ws://localhost:8080/wisp/ http://localhost:8080 "<cookie header>"
-// The relay must refuse anything that is not Microsoft's, on a web port, over TCP, and (with WARP off,
-// as in CI) must not open even a Microsoft stream: nothing leaves except through Cloudflare.
+// The relay must refuse anything that is not a real host name, on a web port, over TCP, and (with
+// WARP off, as in CI) must not open even a stream to a real name: nothing leaves except through
+// Cloudflare.
 import WebSocket from 'ws';
 
 const [url, origin, cookie] = process.argv.slice(2);
@@ -53,11 +54,15 @@ if (!first || first[0] !== T_CONTINUE || first.readUInt32LE(1) !== 0 || first.re
 console.log('ok: server speaks first (CONTINUE, stream 0, buffer', first.readUInt32LE(5) + ')');
 
 const cases = [
-  [1, 'evil.example.com', 443, 1, 0x48, 'a host that is not Microsoft'],
+  // A real name, any name, reaches the same wall every other stream does here: no confirmed
+  // Cloudflare exit in CI (WARP is off). The allow-list is gone (see wisp.rs): a fixed list of
+  // domains could never keep up with the sign-up's own vendor pages, whose bot-check domains
+  // rotate through many short-lived aliases.
+  [1, 'evil.example.com', 443, 1, 0x03, 'a real-looking name, not blocked by name any more'],
   [3, 'login.live.com', 22, 1, 0x48, 'a port that is not a web port'],
   [5, '127.0.0.1', 443, 1, 0x48, 'a loopback address'],
   [7, '169.254.169.254', 80, 1, 0x48, 'the cloud metadata address'],
-  [9, 'login.live.com.evil.com', 443, 1, 0x48, 'a look-alike name'],
+  [9, 'login.live.com.evil.com', 443, 1, 0x03, 'a look-alike name, also just a name now'],
   [11, 'login.live.com', 443, 2, 0x48, 'UDP'],
   [13, 'login.live.com', 443, 1, 0x03, 'Microsoft, but with no confirmed Cloudflare exit'],
 ];
