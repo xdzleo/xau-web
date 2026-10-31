@@ -40,6 +40,8 @@ const RUNTIME_TIMEOUT = TIMEOUTS.runtime ?? 25_000; // the runtime (scripts, ser
 const FIELD_TIMEOUT = TIMEOUTS.field ?? 25_000; // the page must show its field by then, counted from when it is wanted
 const NAVIGATION_TIMEOUT = TIMEOUTS.navigation ?? 12_000; // a page the window went to must have arrived by then, or it is asked for again
 const NAVIGATION_RETRIES = 3;
+const TRANSPORT_RETRIES = TIMEOUTS.transportRetries ?? 3; // the libcurl transport drops a connection now and then; a GET is asked for again
+const TRANSPORT_RETRY_DELAY = TIMEOUTS.transportRetryDelay ?? 250;
 const PAGE_LIFETIME = 4 * 60_000; // a page loaded ahead and left this long is loaded again
 const KEEP_PRELOADED = 10 * 60_000; // ...and one nobody asked for in this long is dropped
 const SCAN_EVERY = 500;
@@ -309,6 +311,24 @@ function pluginClass(Base) {
     install(frame) {
       super.install(frame);
       const page = this.page;
+      // The libcurl transport (TLS done in WebAssembly) reaches Microsoft through one relayed connection, and that
+      // connection drops now and then on its own — an SSL handshake lost, a response cut short mid-transfer — with
+      // nothing wrong with the page asked for. A GET carries nothing that sending twice could harm, so it is asked
+      // for again a few times before the drop is let through as the "Internal Service Worker Error" Scramjet itself
+      // turns a transport exception into; a request carrying a body (anything typed and sent) is never retried.
+      const rawFetch = frame.fetchHandler.handleFetch.bind(frame.fetchHandler);
+      frame.fetchHandler.handleFetch = async (req) => {
+        for (let attempt = 0; ; attempt++) {
+          try {
+            return await rawFetch(req);
+          } catch (e) {
+            if (req.method !== 'GET' || attempt >= TRANSPORT_RETRIES) throw e;
+            mark('fetch:transport-retry');
+            window.__sjTrace?.('transport-retry', String(e?.message || e).slice(0, 120), String(req.rawUrl).slice(0, 100));
+            await new Promise((r) => setTimeout(r, TRANSPORT_RETRY_DELAY * (attempt + 1)));
+          }
+        }
+      };
       const isNavigation = (c) => ['document', 'iframe'].includes(c.parsed.destination);
       // A navigation of the sign-in's own window (not of a frame inside the page): this site started it, or the page on show did.
       const isTopNavigation = (c) => {
@@ -318,22 +338,33 @@ function pluginClass(Base) {
 
       // The sign-up link, and the way back from it.
       this.tap(frame.hooks.fetch.intercept, (c, p) => {
-        if (!isNavigation(c)) return;
         const url = c.parsed.url;
+        // PerimeterX's own "auditor" script (loaded from whichever of its rotating domains the sign-up
+        // picked that day) throws once rewritten through Scramjet — a property it reads comes back
+        // undefined where it would not on the real page — and the whole frame goes blank once that
+        // exception escapes. Nothing in the sign-up depends on it finishing, so it is answered empty
+        // instead of actually fetched.
+        if (/\/bd\/auditor(\.|$)/.test(url.pathname)) {
+          p.response = page.nothing();
+          return;
+        }
+        if (!isNavigation(c)) return;
         const clean = unhostedSignup(url.href);
         window.__sjTrace?.('navigation', url.href.slice(0, 100), 'clean:', clean && clean.slice(0, 100), 'top:', isTopNavigation(c));
         if (clean) {
           // The page the link opens waits for the Windows host forever; the same page without its marks does not.
           page.inSignup = true;
           p.response = page.nothing();
+          page.navClientId = undefined; // a navigation of our own: whatever client it gets is the one to watch
           queueMicrotask(() => frame.go(clean));
         } else if (page.inSignup && url.href.startsWith(INLINE_LOGIN) && isTopNavigation(c)) {
           // The sign-up sends the person back to the sign-in (done, or "Sign in"): back to the sign-in, as it starts.
           page.inSignup = false;
           p.response = page.nothing();
+          page.navClientId = undefined;
           queueMicrotask(() => page.load());
         } else if (isTopNavigation(c)) {
-          page.watchNavigation(url.href, String(c.request?.method || 'GET').toUpperCase());
+          page.watchNavigation(url.href, String(c.request?.method || 'GET').toUpperCase(), c.request?.clientId);
         }
       });
 
@@ -407,6 +438,7 @@ class Page {
     this.navWatch = 0;
     this.navRetries = 0;
     this.navigating = null; // the page the window is on its way to, while it has not arrived
+    this.navClientId = undefined; // whose redirect chain is being watched, so an unrelated iframe's own navigation is not mistaken for it
     this.frame = rt.controller.createFrame(screen.iframe, { plugins: [new rt.Plugin(this)] });
     pages.add(this);
   }
@@ -429,12 +461,22 @@ class Page {
     mark('page:go');
     clearInterval(this.poll);
     this.poll = setInterval(() => this.look(), 120);
+    this.navClientId = undefined; // whatever client the browser gives this navigation becomes the one watched
     this.frame.go(this.spec.url);
   }
 
   /** The window went to a page. A worker stopped while it carried the answer loses it, and the window would wait for it
-   *  forever: if the page has not arrived in time it is asked for again (a GET only: a form is never sent twice). */
-  watchNavigation(href, method) {
+   *  forever: if the page has not arrived in time it is asked for again (a GET only: a form is never sent twice).
+   *
+   *  `clientId` is what tells this apart from an iframe loading *inside* the page (a captcha widget, a cookie-sync
+   *  frame): such an iframe's own navigation passes every other check here (same destination, same initiator, since
+   *  the iframe tag lives in the page this site did send the window to), but the browser hands it a client of its
+   *  own, never the one the window's own redirect chain carries throughout. The first navigation seen since the
+   *  window was last sent somewhere on purpose sets the client being watched; anything on a different one is some
+   *  other frame's business, not a sign that the window itself is stuck. */
+  watchNavigation(href, method, clientId) {
+    if (this.navClientId === undefined) this.navClientId = clientId;
+    else if (this.navClientId !== clientId) return;
     clearTimeout(this.navWatch);
     this.navigating = method === 'GET' ? href : null;
     if (this.navigating) this.navWatch = setTimeout(() => this.navigateAgain(), NAVIGATION_TIMEOUT);
@@ -446,7 +488,9 @@ class Page {
     if (!href || this.navRetries >= NAVIGATION_RETRIES) return;
     this.navRetries++;
     mark('page:navigation-again');
-    // Watched again from here: the new request can be lost too, before anything of it is seen.
+    // Watched again from here: the new request can be lost too, before anything of it is seen. The browser hands
+    // this retry a fresh client of its own, so that is the one to watch from now on.
+    this.navClientId = undefined;
     this.navWatch = setTimeout(() => this.navigateAgain(), NAVIGATION_TIMEOUT);
     this.frame.go(href);
   }
