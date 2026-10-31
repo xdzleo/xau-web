@@ -38,6 +38,8 @@ const PHONE_DATA = { platform: 'Android', platformVersion: '15.0.0', architectur
 const TIMEOUTS = window.__sjTimeouts || {}; // (the tests shorten these)
 const RUNTIME_TIMEOUT = TIMEOUTS.runtime ?? 25_000; // the runtime (scripts, service worker, transport) must be up by then
 const FIELD_TIMEOUT = TIMEOUTS.field ?? 25_000; // the page must show its field by then, counted from when it is wanted
+const NAVIGATION_TIMEOUT = TIMEOUTS.navigation ?? 12_000; // a page the window went to must have arrived by then, or it is asked for again
+const NAVIGATION_RETRIES = 3;
 const PAGE_LIFETIME = 4 * 60_000; // a page loaded ahead and left this long is loaded again
 const KEEP_PRELOADED = 10 * 60_000; // ...and one nobody asked for in this long is dropped
 const SCAN_EVERY = 500;
@@ -87,6 +89,7 @@ export function wanted() {
 // ------------------------------------------------------------------ the runtime
 
 let runtimeP = null;
+const pages = new Set(); // the sign-in pages open now
 
 function loadScript(src) {
   return new Promise((ok, no) => {
@@ -157,6 +160,7 @@ function loadRuntime() {
       if (!start || start === answered) return;
       answered = start;
       mark('runtime:reconnect');
+      for (const page of pages) page.workerRestarted();
       controller.serviceWorkerController = e.source;
       controller.setupMessagePort();
     });
@@ -328,6 +332,8 @@ function pluginClass(Base) {
           page.inSignup = false;
           p.response = page.nothing();
           queueMicrotask(() => page.load());
+        } else if (isTopNavigation(c)) {
+          page.watchNavigation(url.href, String(c.request?.method || 'GET').toUpperCase());
         }
       });
 
@@ -360,6 +366,7 @@ function pluginClass(Base) {
         const w = c.window;
         applyIdentity(w, page.spec, page.inSignup || String(c.client?.url?.hostname || '') === 'signup.live.com');
         if (!c.isTopLevel) return;
+        page.arrived();
         page.win = w;
         page.client = c.client;
         // A passkey belongs to Microsoft's own address, which this page does not have, so it can never work here:
@@ -397,7 +404,11 @@ class Page {
     this.loadedAt = 0;
     this.on = {}; // message, ready, finish
     this.poll = 0;
+    this.navWatch = 0;
+    this.navRetries = 0;
+    this.navigating = null; // the page the window is on its way to, while it has not arrived
     this.frame = rt.controller.createFrame(screen.iframe, { plugins: [new rt.Plugin(this)] });
+    pages.add(this);
   }
 
   /** The address of the page on show, as it sees it. */
@@ -419,6 +430,37 @@ class Page {
     clearInterval(this.poll);
     this.poll = setInterval(() => this.look(), 120);
     this.frame.go(this.spec.url);
+  }
+
+  /** The window went to a page. A worker stopped while it carried the answer loses it, and the window would wait for it
+   *  forever: if the page has not arrived in time it is asked for again (a GET only: a form is never sent twice). */
+  watchNavigation(href, method) {
+    clearTimeout(this.navWatch);
+    this.navigating = method === 'GET' ? href : null;
+    if (this.navigating) this.navWatch = setTimeout(() => this.navigateAgain(), NAVIGATION_TIMEOUT);
+  }
+
+  navigateAgain() {
+    clearTimeout(this.navWatch);
+    const href = this.navigating;
+    if (!href || this.navRetries >= NAVIGATION_RETRIES) return;
+    this.navRetries++;
+    mark('page:navigation-again');
+    // Watched again from here: the new request can be lost too, before anything of it is seen.
+    this.navWatch = setTimeout(() => this.navigateAgain(), NAVIGATION_TIMEOUT);
+    this.frame.go(href);
+  }
+
+  /** The worker started again: a page it was carrying is lost, so it is asked for at once (after the new port is up). */
+  workerRestarted() {
+    if (this.navigating) setTimeout(() => this.navigateAgain(), 500);
+  }
+
+  /** A page arrived in the window. */
+  arrived() {
+    clearTimeout(this.navWatch);
+    this.navigating = null;
+    this.navRetries = 0;
   }
 
   /** Whether the page shows something to type into. */
@@ -461,6 +503,8 @@ class Page {
 
   destroy() {
     clearInterval(this.poll);
+    clearTimeout(this.navWatch);
+    pages.delete(this);
     const frames = this.rt.controller.frames;
     const i = frames.indexOf(this.frame);
     if (i >= 0) frames.splice(i, 1);
